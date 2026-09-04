@@ -1,10 +1,54 @@
+# Node Dependencies & Build Artifacts
+node_modules/
 frontend/node_modules/
+dist/
 frontend/dist/
+build/
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+backend/venv/
 backend/.venv/
+backend/env/
+
+# Python Caches & Bytecode
+__pycache__/
 backend/__pycache__/
-backend/*.pyc
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+backend/.pytest_cache/
+
+# Databases & Local Storage
+*.db
+*.sqlite
+*.sqlite3
+backend/*.db
 backend/sih26047.db
+
+# Dynamic File Uploads & Voice Temp Storage
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# Environment & Secrets
 .env
 *.env
-.DS_Store
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# IDE & OS System Files
 .vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 import hashlib
 import re
@@ -7,8 +7,52 @@ import json
 import os
 import uuid
 import secrets
-from typing import Optional, List
+import tempfile
+import subprocess
+from typing import Optional, List, Dict, Any
 from fastapi import Request
+
+from clinical_nlu import extract_clinical_entities
+from conversation_repair import analyze_repair, localized_response
+from ai1f_orchestrator import build_turn_response
+from ai2_safety import evaluate_safety, PRIORITY as SAFETY_PRIORITY
+from ai3a.integration import register_ai3a
+from ai3c_document_classifier import classify_document
+from ai3d_medical_extractor import extract_structured_medical_data
+from ai3e_document_verification import build_verification_summary, apply_document_verification
+from ai3f_clinical_timeline import build_timeline
+from ai3g_explainability import explain_document, explain_timeline
+from ai3h_clinical_handoff import build_clinical_handoff
+from ai4a_clinical_summary import build_clinical_summary
+from ai4b_clinical_risk import build_risk_assessment
+from ai4c_clinical_decision_support import build_decision_support
+from ai4d_medication_intelligence import build_medication_intelligence
+from ai4e_investigation_intelligence import build_investigation_intelligence
+from ai4f_clinical_question_assistant import answer_clinical_question
+from ai4g_consultation_copilot import build_consultation_copilot
+from ai4h_final_clinical_gate import build_final_clinical_gate
+from phase5a_integration_audit import build_integration_audit
+from ai5b_encounter_queue import (normalize_department, normalize_priority, normalize_status, can_transition, queue_sort_key, serialize_encounter, ROLE_CAN_MANAGE_QUEUE)
+from ai5c_doctor_workspace import build_doctor_workspace
+from ai5d_consultation import build_consultation_payload, normalize_sections, consultation_summary
+from ai5e_triage import (TRIAGE_ROLES, normalize_triage_action, triage_action_status, serialize_triage_item, build_triage_dashboard)
+from ai5g_analytics import build_analytics_dashboard
+
+# Phase AI-1D: optional local speech stack. The server remains usable when these
+# packages/models are not installed; voice endpoints return a clear setup error.
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except Exception:
+    WhisperModel = None
+    FASTER_WHISPER_AVAILABLE = False
+
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except Exception:
+    edge_tts = None
+    EDGE_TTS_AVAILABLE = False
 
 # Phase 5C: lightweight local NLP/ML layer (no external model/API required)
 try:
@@ -20,17 +64,29 @@ except Exception:
     SKLEARN_AVAILABLE = False
 
 from fastapi import UploadFile, File, Form
+from fastapi.responses import FileResponse
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, text as sql_text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, inspect, text as sql_text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_URL = f"sqlite:///{BASE_DIR / 'sih26047.db'}"
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
+
+VOICE_TMP_DIR = UPLOAD_DIR / "voice_tmp"
+VOICE_TMP_DIR.mkdir(exist_ok=True)
+WHISPER_MODEL_SIZE = os.getenv("MEDIKIOSK_WHISPER_MODEL", "small")
+WHISPER_DEVICE = os.getenv("MEDIKIOSK_WHISPER_DEVICE", "auto")
+WHISPER_COMPUTE_TYPE = os.getenv("MEDIKIOSK_WHISPER_COMPUTE_TYPE", "int8")
+TTS_VOICE_MAP = {
+    "en-IN": os.getenv("MEDIKIOSK_TTS_EN_IN", "en-IN-NeerjaNeural"),
+    "hi-IN": os.getenv("MEDIKIOSK_TTS_HI_IN", "hi-IN-SwaraNeural"),
+}
+_whisper_model = None
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
@@ -74,6 +130,19 @@ class MedicalDocument(Base):
     stored_path = Column(String, nullable=True)
     extracted_text = Column(Text, nullable=True)
     extracted_data = Column(Text, nullable=True)
+    classification = Column(String, nullable=True)
+    classification_confidence = Column(String, nullable=True)
+    classification_method = Column(String, nullable=True)
+    classification_evidence = Column(Text, nullable=True)
+    classification_needs_review = Column(Integer, default=0)
+    structured_extraction = Column(Text, nullable=True)
+    extraction_needs_review = Column(Integer, default=1)
+    extraction_method = Column(String, nullable=True)
+    verification_status = Column(String, default="Pending")
+    verified_data = Column(Text, nullable=True)
+    verification_notes = Column(Text, nullable=True)
+    verified_by = Column(Integer, nullable=True)
+    verified_at = Column(DateTime, nullable=True)
     status = Column(String, default="Processed")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -136,6 +205,88 @@ class AuditEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class InterviewState(Base):
+    """Persistent state for one AI clinical-intake encounter.
+
+    AI-1A makes the conversation state server-owned instead of trusting the
+    browser to resend the complete history on every answer. This is an
+    encounter/session memory layer, not a diagnostic model.
+    """
+    __tablename__ = "interview_states"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    session_id = Column(String, unique=True, nullable=False, index=True)
+    language = Column(String, nullable=False, default="en-IN")
+    pathway = Column(String, nullable=True)
+    current_question_id = Column(String, nullable=True)
+    status = Column(String, nullable=False, default="active")
+    structured_data = Column(Text, nullable=False, default="{}")
+    answered_question_ids = Column(Text, nullable=False, default="[]")
+    conversation = Column(Text, nullable=False, default="[]")
+    risk_level = Column(String, nullable=False, default="none")
+    red_flags = Column(Text, nullable=False, default="[]")
+    version = Column(String, nullable=False, default="AI-2.1")
+    repair_count = Column(Integer, nullable=False, default=0)
+    voice_failure_count = Column(Integer, nullable=False, default=0)
+    last_input_mode = Column(String, nullable=True, default="text")
+    last_repair_action = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class VoiceTurn(Base):
+    """Metadata for one voice interaction. Raw patient audio is not persisted by default."""
+    __tablename__ = "voice_turns"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    session_id = Column(String, nullable=False, index=True)
+    language = Column(String, nullable=False, default="en-IN")
+    direction = Column(String, nullable=False, default="input")
+    transcript = Column(Text, nullable=True)
+    status = Column(String, nullable=False, default="completed")
+    provider = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AccessibilityPreference(Base):
+    """Per-patient kiosk accessibility preferences. No clinical data is stored here."""
+    __tablename__ = "accessibility_preferences"
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    language = Column(String, nullable=False, default="en-IN")
+    input_mode = Column(String, nullable=False, default="touch")
+    font_scale = Column(String, nullable=False, default="1.0")
+    high_contrast = Column(Integer, nullable=False, default=0)
+    reduced_motion = Column(Integer, nullable=False, default=0)
+    captions = Column(Integer, nullable=False, default=1)
+    audio_enabled = Column(Integer, nullable=False, default=1)
+    audio_speed = Column(String, nullable=False, default="1.0")
+    assisted_mode = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Encounter(Base):
+    """One hospital visit/OPD episode. Queue state is operational, not clinical."""
+    __tablename__ = "encounters"
+    __table_args__ = (UniqueConstraint("visit_date", "department", "token_number", name="uq_encounter_daily_department_token"),)
+    id = Column(Integer, primary_key=True, index=True)
+    patient_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    department = Column(String, nullable=False, default="General Medicine", index=True)
+    visit_date = Column(String, nullable=False, index=True)
+    token_number = Column(Integer, nullable=False)
+    priority = Column(String, nullable=False, default="normal", index=True)
+    status = Column(String, nullable=False, default="waiting", index=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    called_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    triage_status = Column(String, nullable=False, default="unreviewed", index=True)
+    triage_notes = Column(Text, nullable=True)
+    triage_updated_by = Column(Integer, nullable=True)
+    triage_updated_at = Column(DateTime, nullable=True)
+
+
 class Consultation(Base):
     __tablename__ = "consultations"
     id = Column(Integer, primary_key=True, index=True)
@@ -151,8 +302,76 @@ class Consultation(Base):
     nlp_data = Column(Text, nullable=True)
     ai_summary = Column(Text, nullable=True)
     ai_summary_generated_at = Column(DateTime, nullable=True)
+    encounter_id = Column(Integer, ForeignKey("encounters.id"), nullable=True, index=True)
+    consultation_status = Column(String, default="draft", index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
     patient = relationship("User", back_populates="consultations")
+
+
+class Department(Base):
+    __tablename__ = "departments"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False, unique=True, index=True)
+    specialty = Column(String, nullable=False, default="General Medicine")
+    active = Column(Integer, nullable=False, default=1, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DoctorProfile(Base):
+    __tablename__ = "doctor_profiles"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False, index=True)
+    specialty = Column(String, nullable=False, default="General Medicine")
+    department = Column(String, nullable=False, default="General Medicine", index=True)
+    registration_number = Column(String, nullable=True)
+    active = Column(Integer, nullable=False, default=1, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class OPDConfiguration(Base):
+    __tablename__ = "opd_configurations"
+    id = Column(Integer, primary_key=True, index=True)
+    department = Column(String, nullable=False, unique=True, index=True)
+    working_days = Column(String, nullable=False, default="Mon,Tue,Wed,Thu,Fri")
+    start_time = Column(String, nullable=False, default="09:00")
+    end_time = Column(String, nullable=False, default="17:00")
+    active = Column(Integer, nullable=False, default=1)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DoctorAvailability(Base):
+    __tablename__ = "doctor_availability"
+    __table_args__ = (UniqueConstraint("doctor_id", "day_of_week", "start_time", "end_time", name="uq_doctor_availability_window"),)
+    id = Column(Integer, primary_key=True, index=True)
+    doctor_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    day_of_week = Column(String, nullable=False)
+    start_time = Column(String, nullable=False)
+    end_time = Column(String, nullable=False)
+    active = Column(Integer, nullable=False, default=1, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class RoutingRule(Base):
+    __tablename__ = "routing_rules"
+    id = Column(Integer, primary_key=True, index=True)
+    department = Column(String, nullable=False, index=True)
+    specialty = Column(String, nullable=False, index=True)
+    doctor_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    priority = Column(Integer, nullable=False, default=100)
+    active = Column(Integer, nullable=False, default=1, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class HospitalConfiguration(Base):
+    __tablename__ = "hospital_configuration"
+    id = Column(Integer, primary_key=True, index=True)
+    hospital_name = Column(String, nullable=False, default="SIH26047 Demo Hospital")
+    facility_code = Column(String, nullable=False, default="SIH26047-DEMO-FACILITY")
+    timezone = Column(String, nullable=False, default="Asia/Kolkata")
+    default_department = Column(String, nullable=False, default="General Medicine")
+    active = Column(Integer, nullable=False, default=1)
+    updated_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -180,8 +399,95 @@ def ensure_phase4b_columns():
 
 ensure_phase4b_columns()
 
-# Phase 5A tables are created alongside the existing Phase 3-4 schema.
+
+def ensure_ai5d_columns():
+    with engine.begin() as conn:
+        columns = {row[1] for row in conn.execute(sql_text("PRAGMA table_info(consultations)"))}
+        additions = {
+            "encounter_id": "INTEGER",
+            "consultation_status": "VARCHAR DEFAULT 'draft'",
+            "updated_at": "DATETIME",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                conn.execute(sql_text(f"ALTER TABLE consultations ADD COLUMN {name} {ddl}"))
+
+ensure_ai5d_columns()
+
+def ensure_ai5e_columns():
+    with engine.begin() as conn:
+        columns = {row[1] for row in conn.execute(sql_text("PRAGMA table_info(encounters)"))}
+        additions = {
+            "triage_status": "VARCHAR DEFAULT 'unreviewed'",
+            "triage_notes": "TEXT",
+            "triage_updated_by": "INTEGER",
+            "triage_updated_at": "DATETIME",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                conn.execute(sql_text(f"ALTER TABLE encounters ADD COLUMN {name} {ddl}"))
+
+ensure_ai5e_columns()
+
+def ensure_ai3c_columns():
+    with engine.begin() as conn:
+        columns = {row[1] for row in conn.execute(sql_text("PRAGMA table_info(medical_documents)"))}
+        additions = {
+            "classification": "VARCHAR",
+            "classification_confidence": "VARCHAR",
+            "classification_method": "VARCHAR",
+            "classification_evidence": "TEXT",
+            "classification_needs_review": "INTEGER DEFAULT 0",
+            "structured_extraction": "TEXT",
+            "extraction_needs_review": "INTEGER DEFAULT 0",
+            "extraction_method": "VARCHAR",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                conn.execute(sql_text(f"ALTER TABLE medical_documents ADD COLUMN {name} {ddl}"))
+
+ensure_ai3c_columns()
+
+def ensure_ai3e_columns():
+    with engine.begin() as conn:
+        columns = {row[1] for row in conn.execute(sql_text("PRAGMA table_info(medical_documents)"))}
+        additions = {
+            "verification_status": "VARCHAR DEFAULT 'Pending'",
+            "verified_data": "TEXT",
+            "verification_notes": "TEXT",
+            "verified_by": "INTEGER",
+            "verified_at": "DATETIME",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                conn.execute(sql_text(f"ALTER TABLE medical_documents ADD COLUMN {name} {ddl}"))
+
+ensure_ai3e_columns()
+
+def ensure_phase1e_columns():
+    with engine.begin() as conn:
+        columns = {row[1] for row in conn.execute(sql_text("PRAGMA table_info(interview_states)"))}
+        additions = {
+            "repair_count": "INTEGER DEFAULT 0",
+            "voice_failure_count": "INTEGER DEFAULT 0",
+            "last_input_mode": "VARCHAR",
+            "last_repair_action": "VARCHAR",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                conn.execute(sql_text(f"ALTER TABLE interview_states ADD COLUMN {name} {ddl}"))
+
+ensure_phase1e_columns()
+
+# Phase 5A/5B tables are created alongside the existing Phase 3-4 schema.
 Base.metadata.create_all(bind=engine)
+
+def ensure_phase5b_indexes():
+    with engine.begin() as conn:
+        # Existing databases created before AI-5B need the same token uniqueness guarantee.
+        conn.execute(sql_text("CREATE UNIQUE INDEX IF NOT EXISTS uq_encounter_daily_department_token ON encounters (visit_date, department, token_number)"))
+
+ensure_phase5b_indexes()
 
 
 def hash_password(password: str) -> str:
@@ -217,6 +523,27 @@ def seed_demo_data():
                 password_hash=hash_password("doctor123"), role="doctor"
             )
             db.add(doctor)
+            db.flush()
+        admin = db.query(User).filter(User.email == "admin@sih26047.local").first()
+        if not admin:
+            admin = User(
+                name="Hospital Administrator", email="admin@sih26047.local",
+                password_hash=hash_password("admin123"), role="admin"
+            )
+            db.add(admin)
+            db.flush()
+        doctor_profile = db.query(DoctorProfile).filter(DoctorProfile.user_id == doctor.id).first()
+        if not doctor_profile:
+            db.add(DoctorProfile(user_id=doctor.id, specialty="General Medicine", department="General Medicine", active=1))
+        dept = db.query(Department).filter(Department.name == "General Medicine").first()
+        if not dept:
+            db.add(Department(name="General Medicine", specialty="General Medicine", active=1))
+        opd = db.query(OPDConfiguration).filter(OPDConfiguration.department == "General Medicine").first()
+        if not opd:
+            db.add(OPDConfiguration(department="General Medicine", working_days="Mon,Tue,Wed,Thu,Fri", start_time="09:00", end_time="17:00", active=1))
+        hospital = db.query(HospitalConfiguration).first()
+        if not hospital:
+            db.add(HospitalConfiguration())
         db.commit()
     finally:
         db.close()
@@ -265,8 +592,8 @@ def authenticate_request(request: Request):
 
 app = FastAPI(
     title="SIH26047 Clinical AI API",
-    version="6.0.0",
-    description="SIH26047 Phase 5F: cumulative clinical prototype with validation, physician AI synthesis with local AI/NLP symptom understanding, consent, AYUSH, documents, and FHIR-ready interoperability."
+    version="8.0.0",
+    description="SIH26047 Phase 5B: cumulative clinical prototype with validation, physician AI synthesis with local AI/NLP symptom understanding, consent, AYUSH, documents, and FHIR-ready interoperability, including AI-3C document classification."
 )
 
 app.add_middleware(
@@ -274,6 +601,9 @@ app.add_middleware(
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
+
+# AI-3A unified document-intake module.
+register_ai3a(app, storage_dir=str(BASE_DIR / "data" / "documents"))
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
@@ -331,6 +661,22 @@ class InterviewAnswer(BaseModel):
     language: str = "en-IN"
 
 
+class ClinicalNLURequest(BaseModel):
+    text: str = Field(min_length=1)
+    language: str = "en-IN"
+    question_id: Optional[str] = None
+
+
+class ConversationRepairRequest(BaseModel):
+    patient_id: int
+    session_id: str
+    text: str = ""
+    event: str = "answer"
+    attempt: int = Field(default=0, ge=0, le=10)
+    language: str = "en-IN"
+    input_mode: str = "voice"
+
+
 class InterviewComplete(BaseModel):
     patient_id: int
     session_id: str
@@ -347,6 +693,22 @@ class ConsentRequest(BaseModel):
     granted: bool = True
 
 
+class AccessibilityPreferenceRequest(BaseModel):
+    language: str = "en-IN"
+    input_mode: str = "touch"
+    font_scale: str = "1.0"
+    high_contrast: bool = False
+    reduced_motion: bool = False
+    captions: bool = True
+    audio_enabled: bool = True
+    audio_speed: str = "1.0"
+    assisted_mode: bool = False
+
+
+class ClinicalQuestionRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=1000)
+
+
 class FHIRExportRequest(BaseModel):
     patient_id: int
     exported_by: Optional[int] = None
@@ -359,6 +721,90 @@ class ABDMExportRequest(BaseModel):
     facility_id: str = "SIH26047-DEMO-FACILITY"
     practitioner_id: str = "SIH26047-DEMO-HPR"
     consent_reference: Optional[str] = None
+
+class EncounterCreateRequest(BaseModel):
+    patient_id: int
+    department: str = Field(default="General Medicine", min_length=1, max_length=80)
+    priority: str = Field(default="normal", min_length=1, max_length=20)
+    reason: str = Field(default="", max_length=500)
+    doctor_id: Optional[int] = None
+
+
+class EncounterStatusRequest(BaseModel):
+    status: str = Field(min_length=1, max_length=30)
+    doctor_id: Optional[int] = None
+
+
+class TriageActionRequest(BaseModel):
+    action: str = Field(min_length=1, max_length=30)
+    notes: str = Field(default="", max_length=3000)
+    priority: Optional[str] = Field(default=None, max_length=20)
+
+
+class ConsultationStartRequest(BaseModel):
+    encounter_id: int
+    title: str = Field(default="Clinical consultation", min_length=1, max_length=120)
+
+
+class ConsultationUpdateRequest(BaseModel):
+    sections: dict = Field(default_factory=dict)
+    doctor_notes: str = Field(default="", max_length=5000)
+
+
+class ConsultationCompleteRequest(BaseModel):
+    sections: dict = Field(default_factory=dict)
+    doctor_notes: str = Field(default="", max_length=5000)
+    doctor_review: str = Field(default="Completed", min_length=1, max_length=40)
+
+
+
+class AdminDepartmentRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    specialty: str = Field(default="General Medicine", min_length=2, max_length=100)
+    active: bool = True
+
+
+class AdminDoctorRequest(BaseModel):
+    user_id: Optional[int] = None
+    name: Optional[str] = Field(default=None, min_length=2, max_length=120)
+    email: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=6, max_length=200)
+    specialty: str = Field(default="General Medicine", min_length=2, max_length=100)
+    department: str = Field(default="General Medicine", min_length=2, max_length=100)
+    registration_number: str = Field(default="", max_length=100)
+    active: bool = True
+
+
+class AdminOPDRequest(BaseModel):
+    department: str = Field(min_length=2, max_length=100)
+    working_days: List[str] = Field(default_factory=lambda: ["Mon", "Tue", "Wed", "Thu", "Fri"])
+    start_time: str = Field(default="09:00", min_length=5, max_length=5)
+    end_time: str = Field(default="17:00", min_length=5, max_length=5)
+    active: bool = True
+
+
+class AdminAvailabilityRequest(BaseModel):
+    doctor_id: int
+    day_of_week: str = Field(min_length=3, max_length=9)
+    start_time: str = Field(min_length=5, max_length=5)
+    end_time: str = Field(min_length=5, max_length=5)
+    active: bool = True
+
+
+class AdminRoutingRequest(BaseModel):
+    department: str = Field(min_length=2, max_length=100)
+    specialty: str = Field(min_length=2, max_length=100)
+    doctor_id: Optional[int] = None
+    priority: int = Field(default=100, ge=0, le=10000)
+    active: bool = True
+
+
+class AdminHospitalRequest(BaseModel):
+    hospital_name: str = Field(min_length=2, max_length=200)
+    facility_code: str = Field(min_length=2, max_length=100)
+    timezone: str = Field(default="Asia/Kolkata", min_length=3, max_length=80)
+    default_department: str = Field(default="General Medicine", min_length=2, max_length=100)
+    active: bool = True
 
 
 def user_response(user):
@@ -378,12 +824,12 @@ def profile_response(user):
 
 @app.get("/")
 def root():
-    return {"project": "SIH26047 Clinical AI", "phase": "Phase 4F - Multimodal + Document Intelligence + Physician Workspace", "status": "running"}
+    return {"project": "SIH26047 Clinical AI", "phase": "Phase 5H - Voice & Accessibility", "status": "running"}
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "message": "SIH26047 Final MVP backend is running", "version": "6.0.0"}
+    return {"status": "ok", "message": "SIH26047 Final MVP backend is running", "version": "8.7.0"}
 
 
 @app.post("/api/auth/login")
@@ -437,6 +883,21 @@ def logout(request: Request):
         return {"message": "Signed out securely."}
     finally:
         db.close()
+
+@app.get("/api/system/integration-audit")
+def integration_audit(request: Request):
+    user = authenticate_request(request)
+    if user["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Integration audit is restricted to authorized clinical/administrative roles.")
+    result = build_integration_audit(app, engine, BASE_DIR)
+    db = SessionLocal()
+    try:
+        audit(db, user["id"], user["role"], "integration_audit", "system")
+        db.commit()
+    finally:
+        db.close()
+    return result
+
 
 @app.get("/api/security/status")
 def security_status(request: Request):
@@ -529,6 +990,169 @@ def get_consultations(patient_id: int):
         db.close()
 
 
+# ---------- Phase 5B: Encounter + Queue workflow ----------
+@app.get("/api/doctor/encounters/{encounter_id}/workspace")
+def get_ai5c_doctor_workspace(encounter_id: int, request: Request):
+    """AI-5C: read-only clinician workspace assembled from persisted data and existing AI layers."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Doctor workspace is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        encounter = db.query(Encounter).filter(Encounter.id == encounter_id).first()
+        if not encounter:
+            raise HTTPException(status_code=404, detail="Encounter not found.")
+        patient = db.query(User).filter(User.id == encounter.patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient.id).order_by(MedicalDocument.created_at.desc()).all()
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient.id).order_by(Consultation.created_at.desc()).all()
+        timeline = build_timeline(consultations, documents)
+        summary = build_clinical_summary(patient, consultations, documents, timeline)
+        risk = build_risk_assessment(patient, consultations, documents, summary)
+        decision_support = build_decision_support(patient, consultations, documents, summary, risk)
+        medication = build_medication_intelligence(patient, documents, consultations)
+        investigations = build_investigation_intelligence(patient, documents)
+        copilot = {}
+        clinical_gate = {}
+        if consultations:
+            latest = consultations[0]
+            copilot = build_consultation_copilot(patient, latest, documents, summary, risk, medication, investigations)
+            clinical_gate = build_final_clinical_gate(patient, latest, summary, risk, decision_support, medication, investigations, copilot)
+        workspace = build_doctor_workspace(patient, encounter, documents, consultations, summary, risk, decision_support, medication, investigations, copilot, clinical_gate, timeline)
+        audit(db, actor["id"], actor["role"], "doctor_workspace_viewed", f"encounter:{encounter.id}")
+        db.commit()
+        return {"patient_id": patient.id, "encounter_id": encounter.id, "workspace": workspace}
+    finally:
+        db.close()
+
+
+@app.post("/api/encounters")
+def create_encounter(payload: EncounterCreateRequest, request: Request):
+    actor = authenticate_request(request)
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == payload.patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        if actor["role"] == "patient" and actor["id"] != payload.patient_id:
+            raise HTTPException(status_code=403, detail="Patients can create encounters only for themselves.")
+        if actor["role"] not in ({"patient"} | ROLE_CAN_MANAGE_QUEUE):
+            raise HTTPException(status_code=403, detail="Not authorized to create encounters.")
+        try:
+            department = normalize_department(payload.department)
+            priority = normalize_priority(payload.priority)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if payload.doctor_id is not None:
+            doctor = db.query(User).filter(User.id == payload.doctor_id, User.role == "doctor").first()
+            if not doctor:
+                raise HTTPException(status_code=404, detail="Doctor not found.")
+        else:
+            doctor = None
+        today = date.today().isoformat()
+        active = db.query(Encounter).filter(Encounter.patient_id == payload.patient_id, Encounter.visit_date == today, Encounter.status.in_(["waiting", "called", "in_consultation"])).first()
+        if active:
+            raise HTTPException(status_code=409, detail="Patient already has an active encounter for today.")
+        # SQLite serializes writes; the transaction prevents two committed tokens
+        # from being generated from the same observed maximum.
+        max_token = db.query(Encounter).filter(Encounter.visit_date == today, Encounter.department == department).order_by(Encounter.token_number.desc()).first()
+        token = (max_token.token_number + 1) if max_token else 1
+        encounter = Encounter(patient_id=payload.patient_id, doctor_id=payload.doctor_id, department=department, visit_date=today, token_number=token, priority=priority, status="waiting", reason=payload.reason.strip())
+        db.add(encounter)
+        audit(db, actor["id"], actor["role"], "encounter_created", f"encounter:{payload.patient_id}")
+        db.commit(); db.refresh(encounter)
+        return {"message": "Encounter created", "encounter": serialize_encounter(encounter, patient, doctor)}
+    finally:
+        db.close()
+
+
+@app.get("/api/encounters/{encounter_id}")
+def get_encounter(encounter_id: int, request: Request):
+    actor = authenticate_request(request)
+    db = SessionLocal()
+    try:
+        encounter = db.query(Encounter).filter(Encounter.id == encounter_id).first()
+        if not encounter:
+            raise HTTPException(status_code=404, detail="Encounter not found.")
+        if actor["role"] == "patient" and actor["id"] != encounter.patient_id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this encounter.")
+        patient = db.query(User).filter(User.id == encounter.patient_id).first()
+        doctor = db.query(User).filter(User.id == encounter.doctor_id).first() if encounter.doctor_id else None
+        return {"encounter": serialize_encounter(encounter, patient, doctor)}
+    finally:
+        db.close()
+
+
+@app.get("/api/queue")
+def get_queue(request: Request, department: str = "General Medicine", visit_date: Optional[str] = None, status: str = "waiting,called,in_consultation"):
+    actor = authenticate_request(request)
+    if actor["role"] not in ROLE_CAN_MANAGE_QUEUE:
+        raise HTTPException(status_code=403, detail="Queue access is restricted to clinical/administrative roles.")
+    db = SessionLocal()
+    try:
+        try:
+            department = normalize_department(department)
+            statuses = [normalize_status(x) for x in status.split(",") if x.strip()]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if not statuses:
+            raise HTTPException(status_code=422, detail="At least one queue status is required.")
+        target_date = visit_date or date.today().isoformat()
+        rows = db.query(Encounter).filter(Encounter.department == department, Encounter.visit_date == target_date, Encounter.status.in_(statuses)).all()
+        rows.sort(key=queue_sort_key)
+        items=[]
+        for e in rows:
+            patient=db.query(User).filter(User.id==e.patient_id).first()
+            doctor=db.query(User).filter(User.id==e.doctor_id).first() if e.doctor_id else None
+            item=serialize_encounter(e, patient, doctor)
+            item["queue_position"] = len(items)+1
+            items.append(item)
+        return {"department": department, "visit_date": target_date, "count": len(items), "queue": items}
+    finally:
+        db.close()
+
+
+@app.post("/api/encounters/{encounter_id}/status")
+def update_encounter_status(encounter_id: int, payload: EncounterStatusRequest, request: Request):
+    actor = authenticate_request(request)
+    if actor["role"] not in ROLE_CAN_MANAGE_QUEUE:
+        raise HTTPException(status_code=403, detail="Only clinical/administrative staff can change queue status.")
+    db = SessionLocal()
+    try:
+        encounter = db.query(Encounter).filter(Encounter.id == encounter_id).first()
+        if not encounter:
+            raise HTTPException(status_code=404, detail="Encounter not found.")
+        try:
+            target = normalize_status(payload.status)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if target == encounter.status:
+            raise HTTPException(status_code=409, detail="Encounter is already in that status.")
+        if not can_transition(encounter.status, target):
+            raise HTTPException(status_code=409, detail=f"Invalid status transition: {encounter.status} -> {target}.")
+        if target in {"in_consultation", "completed"} and actor["role"] not in {"doctor", "triage", "admin"}:
+            raise HTTPException(status_code=403, detail="Not authorized for consultation status changes.")
+        if payload.doctor_id is not None:
+            doctor = db.query(User).filter(User.id == payload.doctor_id, User.role == "doctor").first()
+            if not doctor:
+                raise HTTPException(status_code=404, detail="Doctor not found.")
+            encounter.doctor_id = payload.doctor_id
+        now = datetime.utcnow()
+        encounter.status = target
+        if target == "called":
+            encounter.called_at = now
+        if target == "completed":
+            encounter.completed_at = now
+        audit(db, actor["id"], actor["role"], "encounter_status_changed", f"encounter:{encounter.id}")
+        db.commit(); db.refresh(encounter)
+        patient=db.query(User).filter(User.id==encounter.patient_id).first()
+        doctor=db.query(User).filter(User.id==encounter.doctor_id).first() if encounter.doctor_id else None
+        return {"message":"Encounter status updated", "encounter":serialize_encounter(encounter, patient, doctor)}
+    finally:
+        db.close()
+
+
 # ---------- Phase 4E: Medical document intelligence ----------
 ALLOWED_DOC_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".txt"}
 DOCUMENT_TYPES = ["Prescription", "Lab Report", "Discharge Summary", "Imaging Report", "Other"]
@@ -612,16 +1236,409 @@ async def upload_document(patient_id: int = Form(...), document_type: str = Form
         target = UPLOAD_DIR / safe_name
         target.write_bytes(data)
         text = extract_document_text(target, file.content_type or "")
-        dtype = detect_document_type(file.filename or "document", text, document_type)
+        classification = classify_document(text, file.filename or "document", document_type)
+        # Preserve the old document_type contract while allowing AI-3C to correct
+        # an inaccurate user-selected/legacy label when evidence is strong.
+        dtype = classification.document_class if classification.document_class != "Other" else detect_document_type(file.filename or "document", text, document_type)
+        extraction = extract_structured_medical_data(text, dtype)
         findings = extract_medical_entities(text, dtype)
+        # Keep legacy findings for frontend compatibility and expose AI-3D structured items alongside them.
+        findings = findings + extraction.get("items", [])
         status = "Processed" if text.strip() else "Uploaded — OCR unavailable or no readable text"
         doc = MedicalDocument(patient_id=patient_id, filename=file.filename or safe_name, document_type=dtype,
                               mime_type=file.content_type or "", stored_path=str(target), extracted_text=text,
-                              extracted_data=json.dumps(findings), status=status)
+                              extracted_data=json.dumps(findings),
+                              classification=classification.document_class,
+                              classification_confidence=str(classification.confidence),
+                              classification_method=classification.method,
+                              classification_evidence=json.dumps(classification.evidence),
+                              classification_needs_review=int(classification.needs_review),
+                              structured_extraction=json.dumps(extraction),
+                              extraction_needs_review=int(extraction.get("needs_review", True)),
+                              extraction_method="AI-3D explainable local extractor",
+                              verification_status="Pending",
+                              status=status)
         db.add(doc); db.commit(); db.refresh(doc)
         return {"message":"Document processed", "document": {"id":doc.id,"filename":doc.filename,"document_type":doc.document_type,
                 "status":doc.status,"created_at":doc.created_at.isoformat(),"findings":findings,
+                "classification": {"document_class": classification.document_class, "confidence": classification.confidence,
+                                   "needs_review": classification.needs_review, "method": classification.method,
+                                   "evidence": classification.evidence, "scores": classification.scores},
+                "extraction": extraction,
                 "text_preview":(text[:1000] if text else "No text could be extracted. You can still keep the document for practitioner review.")}}
+    finally:
+        db.close()
+
+
+class DocumentClassificationRequest(BaseModel):
+    text: str = Field(default="", max_length=100000)
+    filename: str = Field(default="document", max_length=255)
+    requested_type: str = Field(default="Other", max_length=80)
+
+
+@app.post("/api/documents/classify")
+def classify_document_text(payload: DocumentClassificationRequest):
+    result = classify_document(payload.text, payload.filename, payload.requested_type)
+    return {"classification": {
+        "document_class": result.document_class, "confidence": result.confidence,
+        "needs_review": result.needs_review, "method": result.method,
+        "evidence": result.evidence, "scores": result.scores
+    }}
+
+
+@app.post("/api/documents/{document_id}/classify")
+def classify_stored_document(document_id: int):
+    db = SessionLocal()
+    try:
+        doc = db.query(MedicalDocument).filter(MedicalDocument.id == document_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        result = classify_document(doc.extracted_text or "", doc.filename or "document", doc.document_type or "Other")
+        doc.classification = result.document_class
+        doc.classification_confidence = str(result.confidence)
+        doc.classification_method = result.method
+        doc.classification_evidence = json.dumps(result.evidence)
+        doc.classification_needs_review = int(result.needs_review)
+        if result.document_class != "Other" and result.confidence >= 0.72:
+            doc.document_type = result.document_class
+        extraction = extract_structured_medical_data(doc.extracted_text or "", doc.document_type or result.document_class)
+        doc.structured_extraction = json.dumps(extraction)
+        doc.extraction_needs_review = int(extraction.get("needs_review", True))
+        doc.extraction_method = "AI-3D explainable local extractor"
+        db.commit()
+        return {"message": "Document classified", "classification": {
+            "document_class": result.document_class, "confidence": result.confidence,
+            "needs_review": result.needs_review, "method": result.method,
+            "evidence": result.evidence, "scores": result.scores
+        }}
+    finally:
+        db.close()
+
+
+class DocumentExtractionRequest(BaseModel):
+    text: str = Field(default="", max_length=100000)
+    document_type: str = Field(default="Other", max_length=80)
+
+
+@app.post("/api/documents/extract")
+def extract_document_text_data(payload: DocumentExtractionRequest):
+    extraction = extract_structured_medical_data(payload.text, payload.document_type)
+    return {"extraction": extraction}
+
+
+@app.post("/api/documents/{document_id}/extract")
+def extract_stored_document(document_id: int):
+    db = SessionLocal()
+    try:
+        doc = db.query(MedicalDocument).filter(MedicalDocument.id == document_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        extraction = extract_structured_medical_data(doc.extracted_text or "", doc.document_type or "Other")
+        doc.structured_extraction = json.dumps(extraction)
+        doc.extraction_needs_review = int(extraction.get("needs_review", True))
+        doc.extraction_method = "AI-3D explainable local extractor"
+        legacy = json.loads(doc.extracted_data or "[]")
+        doc.extracted_data = json.dumps(legacy + extraction.get("items", []))
+        db.commit()
+        return {"message": "Document structured data extracted", "extraction": extraction}
+    finally:
+        db.close()
+
+
+class DocumentVerificationRequest(BaseModel):
+    verified_items: List[Dict[str, Any]] = Field(default_factory=list)
+    notes: str = Field(default="", max_length=2000)
+    verified_by: Optional[int] = None
+
+
+@app.get("/api/documents/{document_id}/verification")
+def get_document_verification(document_id: int):
+    db = SessionLocal()
+    try:
+        doc = db.query(MedicalDocument).filter(MedicalDocument.id == document_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        extraction = json.loads(doc.structured_extraction or "{}")
+        summary = build_verification_summary(extraction)
+        return {
+            "document_id": doc.id,
+            "verification_status": doc.verification_status or "Pending",
+            "summary": summary,
+            "verified_data": json.loads(doc.verified_data or "null"),
+            "verification_notes": doc.verification_notes or "",
+            "verified_by": doc.verified_by,
+            "verified_at": doc.verified_at.isoformat() if doc.verified_at else None,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/documents/{document_id}/verify")
+def verify_stored_document(document_id: int, payload: DocumentVerificationRequest):
+    db = SessionLocal()
+    try:
+        doc = db.query(MedicalDocument).filter(MedicalDocument.id == document_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        extraction = json.loads(doc.structured_extraction or "{}")
+        if not extraction:
+            raise HTTPException(status_code=400, detail="No AI-3D extraction is available to verify.")
+        try:
+            verified = apply_document_verification(extraction, payload.verified_items)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        doc.verified_data = json.dumps(verified)
+        doc.verification_notes = payload.notes.strip() or None
+        doc.verified_by = payload.verified_by
+        doc.verified_at = datetime.utcnow()
+        doc.verification_status = verified.get("verification_status", "Pending")
+        db.commit()
+        return {
+            "message": "Document extraction verified",
+            "document_id": doc.id,
+            "verification_status": doc.verification_status,
+            "verified_data": verified,
+            "verification_notes": doc.verification_notes or "",
+            "verified_by": doc.verified_by,
+            "verified_at": doc.verified_at.isoformat(),
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/documents/{document_id}/explainability")
+def get_document_explainability(document_id: int):
+    db = SessionLocal()
+    try:
+        doc = db.query(MedicalDocument).filter(MedicalDocument.id == document_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        return {"document_id": doc.id, "explainability": explain_document(doc)}
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/timeline")
+def get_patient_timeline(patient_id: int):
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).all()
+        timeline = build_timeline(consultations, documents)
+        return {"patient_id": patient_id, "timeline": timeline}
+    finally:
+        db.close()
+
+
+@app.get("/api/documents/{document_id}/timeline-context")
+def get_document_timeline_context(document_id: int):
+    db = SessionLocal()
+    try:
+        doc = db.query(MedicalDocument).filter(MedicalDocument.id == document_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == doc.patient_id).all()
+        consultations = db.query(Consultation).filter(Consultation.patient_id == doc.patient_id).all()
+        timeline = build_timeline(consultations, documents)
+        return {"document_id": document_id, "patient_id": doc.patient_id, "timeline": timeline, "explainability": explain_timeline(timeline)}
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/clinical-summary")
+def get_ai4a_clinical_summary(patient_id: int):
+    """AI-4A: consolidated clinician-facing summary from stored, traceable data."""
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).order_by(Consultation.created_at.desc()).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).order_by(MedicalDocument.created_at.desc()).all()
+        timeline = build_timeline(consultations, documents)
+        return {"patient_id": patient_id, "clinical_summary": build_clinical_summary(patient, consultations, documents, timeline)}
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/risk-assessment")
+def get_ai4b_risk_assessment(patient_id: int, request: Request):
+    """AI-4B: clinician-facing conservative risk/red-flag assessment."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Clinical risk assessment is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).order_by(Consultation.created_at.desc()).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).order_by(MedicalDocument.created_at.desc()).all()
+        timeline = build_timeline(consultations, documents)
+        summary = build_clinical_summary(patient, consultations, documents, timeline)
+        return {"patient_id": patient_id, "risk_assessment": build_risk_assessment(patient, consultations, documents, summary)}
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/decision-support")
+def get_ai4c_decision_support(patient_id: int, request: Request):
+    """AI-4C: conservative clinician decision-support prompts and record checks."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Decision support is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).order_by(Consultation.created_at.desc()).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).order_by(MedicalDocument.created_at.desc()).all()
+        timeline = build_timeline(consultations, documents)
+        summary = build_clinical_summary(patient, consultations, documents, timeline)
+        risk = build_risk_assessment(patient, consultations, documents, summary)
+        support = build_decision_support(patient, consultations, documents, summary, risk)
+        return {"patient_id": patient_id, "decision_support": support}
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/medication-intelligence")
+def get_ai4d_medication_intelligence(patient_id: int, request: Request):
+    """AI-4D: conservative medication reconciliation for clinical staff."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Medication intelligence is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).order_by(Consultation.created_at.desc()).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).order_by(MedicalDocument.created_at.desc()).all()
+        return {"patient_id": patient_id, "medication_intelligence": build_medication_intelligence(patient, documents, consultations)}
+    finally:
+        db.close()
+
+
+@app.get("/api/doctor/consultations/{consultation_id}/copilot")
+def get_ai4g_consultation_copilot(consultation_id: int, request: Request):
+    """AI-4G: clinician-only consultation copilot; read-only draft assistance."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Consultation copilot is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        consultation = db.query(Consultation).filter(Consultation.id == consultation_id).first()
+        if not consultation:
+            raise HTTPException(status_code=404, detail="Consultation not found.")
+        patient = db.query(User).filter(User.id == consultation.patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient.id).order_by(Consultation.created_at.desc()).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient.id).order_by(MedicalDocument.created_at.desc()).all()
+        timeline = build_timeline(consultations, documents)
+        summary = build_clinical_summary(patient, consultations, documents, timeline)
+        risk = build_risk_assessment(patient, consultations, documents, summary)
+        medication = build_medication_intelligence(patient, documents, consultations)
+        investigations = build_investigation_intelligence(patient, documents)
+        copilot = build_consultation_copilot(patient, consultation, documents, summary, risk, medication, investigations)
+        return {"patient_id": patient.id, "consultation_id": consultation.id, "consultation_copilot": copilot}
+    finally:
+        db.close()
+
+
+@app.post("/api/patients/{patient_id}/clinical-question")
+def post_ai4f_clinical_question(patient_id: int, payload: ClinicalQuestionRequest, request: Request):
+    """AI-4F: source-grounded clinical question answering for clinical staff."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Clinical question assistant is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).order_by(Consultation.created_at.desc()).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).order_by(MedicalDocument.created_at.desc()).all()
+        return {"patient_id": patient_id, "clinical_question": answer_clinical_question(patient, consultations, documents, payload.question)}
+    finally:
+        db.close()
+
+
+@app.get("/api/doctor/consultations/{consultation_id}/clinical-gate")
+def get_ai4h_clinical_gate(consultation_id: int, request: Request):
+    """AI-4H: final clinician-facing safety/readiness gate; read-only."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Final clinical gate is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        consultation = db.query(Consultation).filter(Consultation.id == consultation_id).first()
+        if not consultation:
+            raise HTTPException(status_code=404, detail="Consultation not found.")
+        patient = db.query(User).filter(User.id == consultation.patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient.id).order_by(Consultation.created_at.desc()).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient.id).order_by(MedicalDocument.created_at.desc()).all()
+        timeline = build_timeline(consultations, documents)
+        summary = build_clinical_summary(patient, consultations, documents, timeline)
+        risk = build_risk_assessment(patient, consultations, documents, summary)
+        support = build_decision_support(patient, consultations, documents, summary, risk)
+        medication = build_medication_intelligence(patient, documents, consultations)
+        investigations = build_investigation_intelligence(patient, documents)
+        copilot = build_consultation_copilot(patient, consultation, documents, summary, risk, medication, investigations)
+        gate = build_final_clinical_gate(patient, consultation, summary, risk, support, medication, investigations, copilot)
+        return {"patient_id": patient.id, "consultation_id": consultation.id, "clinical_gate": gate}
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/investigation-intelligence")
+def get_ai4e_investigation_intelligence(patient_id: int, request: Request):
+    """AI-4E: conservative longitudinal investigation intelligence for clinical staff."""
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Investigation intelligence is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).order_by(MedicalDocument.created_at.asc()).all()
+        return {"patient_id": patient_id, "investigation_intelligence": build_investigation_intelligence(patient, documents)}
+    finally:
+        db.close()
+
+
+@app.get("/api/patients/{patient_id}/clinical-handoff")
+def get_patient_clinical_handoff(patient_id: int):
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == patient_id).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient_id).all()
+        return {"patient_id": patient_id, "clinical_handoff": build_clinical_handoff(patient_id, consultations, documents)}
+    finally:
+        db.close()
+
+
+@app.get("/api/documents/{document_id}/clinical-handoff")
+def get_document_clinical_handoff(document_id: int):
+    db = SessionLocal()
+    try:
+        doc = db.query(MedicalDocument).filter(MedicalDocument.id == document_id).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail="Document not found.")
+        consultations = db.query(Consultation).filter(Consultation.patient_id == doc.patient_id).all()
+        documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == doc.patient_id).all()
+        return {"document_id": document_id, "patient_id": doc.patient_id, "clinical_handoff": build_clinical_handoff(doc.patient_id, consultations, documents)}
     finally:
         db.close()
 
@@ -634,6 +1651,7 @@ def get_patient_documents(patient_id: int):
         docs=db.query(MedicalDocument).filter(MedicalDocument.patient_id==patient_id).order_by(MedicalDocument.created_at.desc()).all()
         return {"documents":[{"id":d.id,"filename":d.filename,"document_type":d.document_type,"status":d.status,
                 "created_at":d.created_at.isoformat(),"findings":json.loads(d.extracted_data or "[]"),
+                "classification":{"document_class":d.classification or d.document_type,"confidence":float(d.classification_confidence or 0),"needs_review":bool(d.classification_needs_review),"method":d.classification_method,"evidence":json.loads(d.classification_evidence or "[]")},"extraction":json.loads(d.structured_extraction or "{}"),"verification":{"status":d.verification_status or "Pending","verified_data":json.loads(d.verified_data or "null"),"notes":d.verification_notes or "","verified_by":d.verified_by,"verified_at":d.verified_at.isoformat() if d.verified_at else None},
                 "text_preview":(d.extracted_text or "")[:800]} for d in docs]}
     finally: db.close()
 
@@ -655,7 +1673,7 @@ def doctor_patient_workspace(patient_id: int):
         return {"patient":profile_response(patient),
                 "consultations":[{"id":c.id,"title":c.title,"summary":c.summary,"status":c.status,"risk_level":c.risk_level or "none",
                   "red_flags":json.loads(c.red_flags or "[]"),"doctor_review":c.doctor_review or "Pending","doctor_notes":c.doctor_notes or "","ai_summary":json.loads(c.ai_summary) if c.ai_summary else None,"ai_summary_generated_at":c.ai_summary_generated_at.isoformat() if c.ai_summary_generated_at else None,"created_at":c.created_at.isoformat()} for c in consultations],
-                "documents":[{"id":d.id,"filename":d.filename,"document_type":d.document_type,"status":d.status,"created_at":d.created_at.isoformat(),"findings":json.loads(d.extracted_data or "[]"),"text_preview":(d.extracted_text or "")[:1200]} for d in docs],
+                "documents":[{"id":d.id,"filename":d.filename,"document_type":d.document_type,"status":d.status,"created_at":d.created_at.isoformat(),"findings":json.loads(d.extracted_data or "[]"),"classification":{"document_class":d.classification or d.document_type,"confidence":float(d.classification_confidence or 0),"needs_review":bool(d.classification_needs_review),"method":d.classification_method,"evidence":json.loads(d.classification_evidence or "[]")},"extraction":json.loads(d.structured_extraction or "{}"),"text_preview":(d.extracted_text or "")[:1200]} for d in docs],
                 "timeline":timeline}
     finally: db.close()
 
@@ -676,6 +1694,226 @@ def review_consultation(consultation_id: int, payload: DoctorReviewUpdate):
         db.commit(); db.refresh(c)
         return {"message":"Doctor review saved","consultation_id":c.id,"doctor_review":c.doctor_review,"doctor_notes":c.doctor_notes}
     finally: db.close()
+
+
+# ---------- Phase 5E: triage dashboard and human-controlled actions ----------
+@app.get("/api/triage/dashboard")
+def get_ai5e_triage_dashboard(request: Request, department: str = "General Medicine", visit_date: Optional[str] = None):
+    """AI-5E: operational triage view with AI-4B signals surfaced for human review."""
+    actor = authenticate_request(request)
+    if actor["role"] not in TRIAGE_ROLES:
+        raise HTTPException(status_code=403, detail="Triage dashboard is restricted to clinical/administrative roles.")
+    db = SessionLocal()
+    try:
+        try:
+            department = normalize_department(department)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        target_date = visit_date or date.today().isoformat()
+        rows = db.query(Encounter).filter(
+            Encounter.department == department,
+            Encounter.visit_date == target_date,
+            Encounter.status.in_(["waiting", "called", "in_consultation"]),
+        ).all()
+        items = []
+        for encounter in rows:
+            patient = db.query(User).filter(User.id == encounter.patient_id, User.role == "patient").first()
+            if not patient:
+                continue
+            doctor = db.query(User).filter(User.id == encounter.doctor_id).first() if encounter.doctor_id else None
+            consultations = db.query(Consultation).filter(Consultation.patient_id == patient.id).order_by(Consultation.created_at.desc()).all()
+            documents = db.query(MedicalDocument).filter(MedicalDocument.patient_id == patient.id).order_by(MedicalDocument.created_at.desc()).all()
+            timeline = build_timeline(consultations, documents)
+            summary = build_clinical_summary(patient, consultations, documents, timeline)
+            risk = build_risk_assessment(patient, consultations, documents, summary)
+            items.append(serialize_triage_item(encounter, patient, doctor, risk))
+        return {"patient_scope": "current operational queue", "triage_dashboard": build_triage_dashboard(items, department, target_date)}
+    finally:
+        db.close()
+
+
+@app.post("/api/triage/encounters/{encounter_id}/action")
+def act_on_ai5e_triage(encounter_id: int, payload: TriageActionRequest, request: Request):
+    """AI-5E: acknowledgement/escalation/resolution is always a human action."""
+    actor = authenticate_request(request)
+    if actor["role"] not in TRIAGE_ROLES:
+        raise HTTPException(status_code=403, detail="Only triage/clinical administrative staff can act on triage items.")
+    try:
+        action = normalize_triage_action(payload.action)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    db = SessionLocal()
+    try:
+        encounter = db.query(Encounter).filter(Encounter.id == encounter_id).first()
+        if not encounter:
+            raise HTTPException(status_code=404, detail="Encounter not found.")
+        if encounter.status in {"completed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="Completed or cancelled encounters cannot be triaged.")
+        if payload.priority is not None:
+            try:
+                encounter.priority = normalize_priority(payload.priority)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+        target = triage_action_status(action)
+        encounter.triage_status = target
+        encounter.triage_notes = payload.notes.strip()
+        encounter.triage_updated_by = actor["id"]
+        encounter.triage_updated_at = datetime.utcnow()
+        audit(db, actor["id"], actor["role"], f"triage_{action}", f"encounter:{encounter.id}")
+        db.commit(); db.refresh(encounter)
+        patient = db.query(User).filter(User.id == encounter.patient_id).first()
+        doctor = db.query(User).filter(User.id == encounter.doctor_id).first() if encounter.doctor_id else None
+        return {
+            "message": f"Triage action '{action}' recorded",
+            "encounter_id": encounter.id,
+            "triage_status": encounter.triage_status,
+            "priority": encounter.priority,
+            "triage_notes": encounter.triage_notes or "",
+            "human_action": True,
+            "actor_role": actor["role"],
+            "encounter": serialize_encounter(encounter, patient, doctor),
+        }
+    finally:
+        db.close()
+
+
+# ---------- Phase 5D: clinician-owned consultation workflow ----------
+@app.post("/api/doctor/encounters/{encounter_id}/consultation")
+def start_ai5d_consultation(encounter_id: int, payload: ConsultationStartRequest, request: Request):
+    actor = authenticate_request(request)
+    if actor["role"] != "doctor":
+        raise HTTPException(status_code=403, detail="Only doctors can start a consultation.")
+    if payload.encounter_id != encounter_id:
+        raise HTTPException(status_code=400, detail="Encounter ID mismatch.")
+    db = SessionLocal()
+    try:
+        encounter = db.query(Encounter).filter(Encounter.id == encounter_id).first()
+        if not encounter:
+            raise HTTPException(status_code=404, detail="Encounter not found.")
+        if encounter.status not in {"called", "in_consultation"}:
+            raise HTTPException(status_code=409, detail="Encounter must be called or in consultation before starting.")
+        if encounter.doctor_id not in (None, actor["id"]):
+            raise HTTPException(status_code=403, detail="Encounter is assigned to another doctor.")
+        if encounter.doctor_id is None:
+            encounter.doctor_id = actor["id"]
+        if encounter.status == "called":
+            encounter.status = "in_consultation"
+            encounter.called_at = encounter.called_at or datetime.utcnow()
+
+        existing = db.query(Consultation).filter(Consultation.encounter_id == encounter_id).order_by(Consultation.created_at.desc()).first()
+        if existing and (existing.consultation_status or "draft") != "completed":
+            return {"consultation": build_consultation_payload(existing, encounter), "created": False}
+
+        record = Consultation(
+            patient_id=encounter.patient_id,
+            encounter_id=encounter.id,
+            title=payload.title.strip(),
+            summary="Consultation draft.",
+            status="In Consultation",
+            consultation_status="in_progress",
+            doctor_review="Pending",
+            structured_data=json.dumps({"consultation": {}}, ensure_ascii=False),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(record)
+        audit(db, actor["id"], actor["role"], "consultation_started", f"encounter:{encounter.id}")
+        db.commit(); db.refresh(record)
+        return {"consultation": build_consultation_payload(record, encounter), "created": True}
+    finally:
+        db.close()
+
+
+@app.get("/api/doctor/consultations/{consultation_id}/record")
+def get_ai5d_consultation(consultation_id: int, request: Request):
+    actor = authenticate_request(request)
+    if actor["role"] not in {"doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Consultation record is restricted to clinical staff.")
+    db = SessionLocal()
+    try:
+        record = db.query(Consultation).filter(Consultation.id == consultation_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Consultation not found.")
+        encounter = db.query(Encounter).filter(Encounter.id == record.encounter_id).first() if record.encounter_id else None
+        if actor["role"] == "doctor" and encounter and encounter.doctor_id not in (None, actor["id"]):
+            raise HTTPException(status_code=403, detail="Consultation is assigned to another doctor.")
+        return {"consultation": build_consultation_payload(record, encounter)}
+    finally:
+        db.close()
+
+
+@app.put("/api/doctor/consultations/{consultation_id}/record")
+def update_ai5d_consultation(consultation_id: int, payload: ConsultationUpdateRequest, request: Request):
+    actor = authenticate_request(request)
+    if actor["role"] != "doctor":
+        raise HTTPException(status_code=403, detail="Only doctors can edit consultation records.")
+    db = SessionLocal()
+    try:
+        record = db.query(Consultation).filter(Consultation.id == consultation_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Consultation not found.")
+        if record.consultation_status == "completed":
+            raise HTTPException(status_code=409, detail="Completed consultations are locked for this prototype.")
+        encounter = db.query(Encounter).filter(Encounter.id == record.encounter_id).first() if record.encounter_id else None
+        if encounter and encounter.doctor_id not in (None, actor["id"]):
+            raise HTTPException(status_code=403, detail="Consultation is assigned to another doctor.")
+        try:
+            sections = normalize_sections(payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        record.structured_data = json.dumps({"consultation": sections}, ensure_ascii=False)
+        record.summary = consultation_summary(sections)
+        record.doctor_notes = payload.doctor_notes
+        record.status = "In Consultation"
+        record.consultation_status = "in_progress"
+        record.updated_at = datetime.utcnow()
+        audit(db, actor["id"], actor["role"], "consultation_draft_saved", f"consultation:{record.id}")
+        db.commit(); db.refresh(record)
+        return {"message": "Consultation draft saved", "consultation": build_consultation_payload(record, encounter)}
+    finally:
+        db.close()
+
+
+@app.post("/api/doctor/consultations/{consultation_id}/complete")
+def complete_ai5d_consultation(consultation_id: int, payload: ConsultationCompleteRequest, request: Request):
+    actor = authenticate_request(request)
+    if actor["role"] != "doctor":
+        raise HTTPException(status_code=403, detail="Only doctors can complete a consultation.")
+    db = SessionLocal()
+    try:
+        record = db.query(Consultation).filter(Consultation.id == consultation_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail="Consultation not found.")
+        if record.consultation_status == "completed":
+            raise HTTPException(status_code=409, detail="Consultation is already completed.")
+        encounter = db.query(Encounter).filter(Encounter.id == record.encounter_id).first() if record.encounter_id else None
+        if encounter and encounter.doctor_id not in (None, actor["id"]):
+            raise HTTPException(status_code=403, detail="Consultation is assigned to another doctor.")
+        try:
+            sections = normalize_sections(payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        # Completing a consultation is a clinician action. We store exactly what
+        # the doctor submitted; nothing here derives a diagnosis or treatment.
+        record.structured_data = json.dumps({"consultation": sections}, ensure_ascii=False)
+        record.summary = consultation_summary(sections)
+        record.doctor_notes = payload.doctor_notes
+        record.doctor_review = payload.doctor_review[:40]
+        record.status = "Completed"
+        record.consultation_status = "completed"
+        record.updated_at = datetime.utcnow()
+        if encounter:
+            if encounter.status == "in_consultation":
+                encounter.status = "completed"
+            encounter.completed_at = encounter.completed_at or datetime.utcnow()
+        audit(db, actor["id"], actor["role"], "consultation_completed", f"consultation:{record.id}")
+        db.commit(); db.refresh(record)
+        return {
+            "message": "Consultation completed",
+            "consultation": build_consultation_payload(record, encounter),
+            "clinical_decision_source": "doctor_entered",
+        }
+    finally:
+        db.close()
 
 
 # ---------- Phase 5A AYUSH / Ayurveda assessment ----------
@@ -1211,6 +2449,23 @@ def extract_structured(question_id, answer):
         result["severity"] = int(nums[0]) if nums else text
     elif question_id in direct_map:
         result[direct_map[question_id]] = text
+
+    # AI-1B: add conservative semantic evidence without overwriting explicit
+    # question answers. The raw answer remains available for verification.
+    semantic = extract_clinical_entities(text)
+    if semantic.get("positive_symptoms"):
+        result["detected_symptoms"] = semantic["positive_symptoms"]
+    if semantic.get("negated_symptoms"):
+        result["negated_symptoms"] = semantic["negated_symptoms"]
+    if semantic.get("duration_mentions"):
+        result["duration_mentions"] = semantic["duration_mentions"]
+    if semantic.get("severity") is not None and "severity" not in result:
+        result["severity_label"] = semantic["severity"]
+    result["nlu"] = {
+        "intent": semantic.get("intent", "general"),
+        "evidence": semantic.get("evidence", []),
+        "engine": semantic.get("engine"),
+    }
     return result
 
 
@@ -1362,13 +2617,122 @@ def detect_red_flags(question_id: str, answer: str, structured: dict):
     return level, ordered
 
 
-def next_question_for(pathway_name: str, answered: dict):
+def _adaptive_known_slots(answered: dict) -> set:
+    known = set()
+    for key, value in answered.items():
+        if key in {
+            "chief_complaint","onset","location","severity","character",
+            "chest_radiation","chest_exertion","chest_breathlessness",
+            "headache_visual","headache_nausea","headache_trigger",
+            "abdominal_food","abdominal_bowel","abdominal_urinary",
+            "fever_pattern","fever_infection","fever_exposure",
+            "respiratory_cough","respiratory_activity","respiratory_wheeze",
+            "general_change","general_impact","associated","past_history",
+            "medications","allergies","family_history","personal_history","review_systems"
+        } and value not in (None, "", [], {}):
+            known.add(key)
+    evidence = answered.get("clinical_evidence", [])
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                if item.get("duration_mentions"): known.add("onset")
+                if item.get("severity") is not None: known.add("severity")
+    return known
+
+QUESTION_PRIORITY = {
+    "chief_complaint": 100, "onset": 90, "location": 88, "severity": 86, "character": 84,
+    "chest_breathlessness": 99, "chest_radiation": 96, "chest_exertion": 94,
+    "headache_visual": 98, "headache_trigger": 84, "headache_nausea": 82,
+    "abdominal_bowel": 88, "abdominal_urinary": 80, "abdominal_food": 78,
+    "fever_infection": 92, "fever_pattern": 90, "fever_exposure": 70,
+    "respiratory_activity": 92, "respiratory_cough": 88, "respiratory_wheeze": 84,
+    "general_change": 76, "general_impact": 68, "allergies": 65, "associated": 62,
+    "medications": 60, "past_history": 58, "family_history": 42, "personal_history": 38, "review_systems": 30,
+}
+
+def adaptive_next_question(pathway_name: str, answered: dict):
     flow = build_question_flow(pathway_name)
-    answered_ids = set(answered.keys())
-    for question in flow:
-        if question["id"] not in answered_ids:
-            return question, flow
-    return None, flow
+    known = _adaptive_known_slots(answered)
+    candidates = []
+    focused_ids = {q["id"] for q in PATHWAYS.get(pathway_name, {}).get("questions", [])}
+    for index, question in enumerate(flow):
+        qid = question["id"]
+        if qid in answered or qid in known:
+            continue
+        score = QUESTION_PRIORITY.get(qid, 20)
+        if qid in focused_ids:
+            score += 12
+        if qid == "chief_complaint" and "chief_complaint" not in known:
+            score += 1000
+        candidates.append((score, -index, question))
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    if not candidates:
+        return None, flow, {"adaptive": True, "known_slots": sorted(known), "reason": "sufficient_information_for_current_flow"}
+    score, _, question = candidates[0]
+    return question, flow, {
+        "adaptive": True,
+        "known_slots": sorted(known),
+        "selected_score": score,
+        "candidate_count": len(candidates),
+        "reason": "highest_priority_unanswered_information",
+    }
+
+def next_question_for(pathway_name: str, answered: dict):
+    question, flow, _meta = adaptive_next_question(pathway_name, answered)
+    return question, flow
+
+
+def _json_loads(value, default):
+    try:
+        return json.loads(value) if value else default
+    except Exception:
+        return default
+
+
+def get_or_create_interview_state(db, patient_id: int, session_id: str, language: str = "en-IN"):
+    state = db.query(InterviewState).filter(InterviewState.session_id == session_id).first()
+    if state:
+        if state.patient_id != patient_id:
+            raise HTTPException(status_code=403, detail="Interview session does not belong to this patient.")
+        if language in SUPPORTED_LANGUAGES and state.language != language and state.status == "active":
+            state.language = language
+        return state
+    patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found.")
+    state = InterviewState(
+        patient_id=patient_id, session_id=session_id,
+        language=language if language in SUPPORTED_LANGUAGES else "en-IN",
+        structured_data=json.dumps({}, ensure_ascii=False),
+        answered_question_ids=json.dumps([]), conversation=json.dumps([]),
+        red_flags=json.dumps([]),
+    )
+    db.add(state)
+    db.flush()
+    return state
+
+
+def interview_state_response(state: InterviewState):
+    return {
+        "session_id": state.session_id,
+        "patient_id": state.patient_id,
+        "language": state.language,
+        "pathway": state.pathway,
+        "current_question_id": state.current_question_id,
+        "status": state.status,
+        "structured": _json_loads(state.structured_data, {}),
+        "answered_question_ids": _json_loads(state.answered_question_ids, []),
+        "conversation": _json_loads(state.conversation, []),
+        "risk_level": state.risk_level or "none",
+        "red_flags": _json_loads(state.red_flags, []),
+        "version": state.version,
+        "repair_count": state.repair_count or 0,
+        "voice_failure_count": state.voice_failure_count or 0,
+        "last_input_mode": state.last_input_mode or "text",
+        "last_repair_action": state.last_repair_action,
+        "created_at": state.created_at.isoformat() if state.created_at else None,
+        "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+    }
 
 
 
@@ -1506,6 +2870,16 @@ def nlp_analyze(payload: dict):
 
 
 # -----------------------------------------------------------------------------
+# Phase AI-1B: conservative clinical language understanding
+# -----------------------------------------------------------------------------
+@app.post("/api/ai/clinical-understand")
+def clinical_understand(payload: ClinicalNLURequest):
+    if payload.language not in SUPPORTED_LANGUAGES:
+        payload.language = "en-IN"
+    return extract_clinical_entities(payload.text, payload.language)
+
+
+# -----------------------------------------------------------------------------
 # Phase 5F: Validation
 # A small, transparent, versioned benchmark for the prototype NLP layer.
 # These are synthetic test cases for engineering/demo validation, not clinical
@@ -1573,9 +2947,150 @@ def run_validation_suite():
 def validation_summary():
     return run_validation_suite()
 
+@app.post("/api/ai/safety-evaluate")
+def ai_safety_evaluate(payload: dict):
+    """AI-2: evaluate patient-reported information for prototype triage flags."""
+    answer = str(payload.get("answer") or payload.get("text") or "").strip()
+    if not answer:
+        raise HTTPException(status_code=400, detail="answer or text is required")
+    structured = payload.get("structured") or {}
+    if not isinstance(structured, dict):
+        raise HTTPException(status_code=400, detail="structured must be an object")
+    return evaluate_safety(answer, structured)
+
+
 @app.post("/api/validation/run")
 def validation_run():
     return run_validation_suite()
+
+
+@app.post("/api/ai/next-question")
+def ai_next_question(payload: dict):
+    answered = payload.get("structured") or payload.get("answered") or {}
+    if not isinstance(answered, dict):
+        raise HTTPException(status_code=400, detail="structured/answered must be an object.")
+    pathway = str(payload.get("pathway") or classify_pathway(str(answered.get("chief_complaint", ""))))
+    if pathway not in PATHWAYS:
+        pathway = "general"
+    language = str(payload.get("language", "en-IN"))
+    if language not in SUPPORTED_LANGUAGES:
+        language = "en-IN"
+    question, flow, meta = adaptive_next_question(pathway, answered)
+    return {
+        "adaptive": True, "pathway": pathway,
+        "pathway_label": PATHWAYS[pathway]["label"],
+        "question": localize_question(question, language) if question else None,
+        "completed": question is None, "meta": meta,
+        "total_questions": len(flow),
+        "answered_question_ids": [q["id"] for q in flow if q["id"] in answered],
+        "disclaimer": "Question selection organizes clinical history; it is not diagnosis or treatment advice.",
+    }
+
+
+@app.post("/api/ai/orchestrate-turn")
+def ai_orchestrate_turn(payload: dict):
+    """Run one complete AI-1F turn: repair -> clinical understanding -> state -> safety -> next question."""
+    patient_id = payload.get("patient_id")
+    session_id = str(payload.get("session_id", "")).strip()
+    if not patient_id or not session_id:
+        raise HTTPException(status_code=400, detail="patient_id and session_id are required.")
+    language = str(payload.get("language", "en-IN"))
+    if language not in SUPPORTED_LANGUAGES:
+        language = "en-IN"
+    text = str(payload.get("text", ""))
+    event = str(payload.get("event", "answer"))
+    attempt = int(payload.get("attempt", 0) or 0)
+    question_id = str(payload.get("question_id", ""))
+
+    db = SessionLocal()
+    try:
+        state = get_or_create_interview_state(db, int(patient_id), session_id, language)
+        if state.status == "completed":
+            raise HTTPException(status_code=409, detail="This interview has already been completed.")
+
+        repair = analyze_repair(text, event=event, attempt=attempt, current_language=state.language)
+        state.last_input_mode = str(payload.get("input_mode", "voice" if event != "answer" else "text"))
+
+        # Repair actions do not mutate clinical meaning.
+        if repair.get("action") != "accept_answer":
+            if repair.get("action") == "switch_language" and repair.get("requested_language") in SUPPORTED_LANGUAGES:
+                state.language = repair["requested_language"]
+            state.repair_count = (state.repair_count or 0) + 1
+            if repair.get("action") in {"voice_retry", "touch_fallback"}:
+                state.voice_failure_count = (state.voice_failure_count or 0) + 1
+            state.last_repair_action = repair.get("action")
+            state.updated_at = datetime.utcnow()
+            db.commit()
+            next_q = None
+            if state.current_question_id:
+                flow = build_question_flow(state.pathway or "general")
+                q = next((q for q in flow if q.get("id") == state.current_question_id), None)
+                if q:
+                    next_q = localize_question(q, state.language)
+            response = build_turn_response(
+                state=interview_state_response(state), repair=repair,
+                next_question=next_q, risk_level=state.risk_level,
+                red_flags=_json_loads(state.red_flags, []),
+                localized_repair_message=localized_response(repair, state.language),
+            )
+            return response
+
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Answer text is required when accepting an answer.")
+
+        answered = _json_loads(state.structured_data, {})
+        extracted = extract_structured(question_id, text)
+        for key, value in extracted.items():
+            if key not in ("raw", "nlu") and value not in (None, ""):
+                answered[key] = value
+        semantic = extract_clinical_entities(text, state.language)
+        ledger = answered.get("clinical_evidence", [])
+        if not isinstance(ledger, list): ledger = []
+        ledger.append({"question_id": question_id, "text": text.strip(),
+                       "positive_symptoms": semantic.get("positive_symptoms", []),
+                       "negated_symptoms": semantic.get("negated_symptoms", []),
+                       "duration_mentions": semantic.get("duration_mentions", []),
+                       "severity": semantic.get("severity"), "intent": semantic.get("intent", "general")})
+        answered["clinical_evidence"] = ledger[-50:]
+
+        if not state.pathway and answered.get("chief_complaint"):
+            state.pathway = classify_pathway(answered["chief_complaint"])
+        pathway = state.pathway or "general"
+        risk_level, red_flags = detect_red_flags(question_id, text, answered)
+        priority = {"none": 0, "watch": 1, "urgent": 2, "emergency": 3}
+        if priority.get(state.risk_level or "none", 0) > priority.get(risk_level, 0):
+            risk_level = state.risk_level
+        old_flags = _json_loads(state.red_flags, [])
+        merged = {x.get("id"): x for x in old_flags if x.get("id")}
+        for flag in red_flags: merged[flag.get("id")] = flag
+        red_flags = sorted(merged.values(), key=lambda x: priority.get(x.get("level", "none"), 0), reverse=True)
+        state.risk_level = risk_level
+        state.red_flags = json.dumps(red_flags, ensure_ascii=False)
+
+        answered_ids = _json_loads(state.answered_question_ids, [])
+        if question_id and question_id not in answered_ids: answered_ids.append(question_id)
+        conversation = _json_loads(state.conversation, [])
+        conversation.append({"question_id": question_id, "answer": text.strip(),
+                             "extracted": {k:v for k,v in extracted.items() if k != "raw"}})
+        next_q, flow = next_question_for(pathway, answered)
+        state.current_question_id = next_q["id"] if next_q else None
+        state.status = "completed" if next_q is None else "active"
+        state.structured_data = json.dumps(answered, ensure_ascii=False)
+        state.answered_question_ids = json.dumps(answered_ids, ensure_ascii=False)
+        state.conversation = json.dumps(conversation, ensure_ascii=False)
+        state.last_repair_action = None
+        state.updated_at = datetime.utcnow()
+        db.commit()
+
+        localized_q = localize_question(next_q, state.language) if next_q else None
+        return build_turn_response(
+            state=interview_state_response(state),
+            next_question=localized_q,
+            risk_level=risk_level,
+            red_flags=red_flags,
+        )
+    finally:
+        db.close()
 
 
 @app.get("/api/interview/questions")
@@ -1590,48 +3105,428 @@ def interview_questions(language: str = "en-IN"):
 
 
 
+@app.get("/api/interview/state/{session_id}")
+def interview_state(session_id: str, patient_id: int):
+    """Resume an active AI-1A encounter from server-owned state."""
+    db = SessionLocal()
+    try:
+        state = db.query(InterviewState).filter(InterviewState.session_id == session_id, InterviewState.patient_id == patient_id).first()
+        if not state:
+            raise HTTPException(status_code=404, detail="Interview session not found.")
+        return interview_state_response(state)
+    finally:
+        db.close()
+
+
 @app.post("/api/interview/answer")
 def interview_answer(payload: InterviewAnswer):
     if not payload.answer.strip():
         raise HTTPException(status_code=400, detail="Please provide an answer.")
+    if payload.language not in SUPPORTED_LANGUAGES:
+        payload.language = "en-IN"
 
-    extracted = extract_structured(payload.question_id, payload.answer)
-    nlp = analyze_nlp_text(payload.answer, payload.language)
-    answered = dict(payload.answers or {})
-    answered.update({k: v for k, v in extracted.items() if k != "raw"})
+    db = SessionLocal()
+    try:
+        state = get_or_create_interview_state(db, payload.patient_id, payload.session_id, payload.language)
+        if state.status == "completed":
+            raise HTTPException(status_code=409, detail="This interview has already been completed.")
 
-    if payload.question_id == "chief_complaint":
-        pathway_name = classify_pathway(payload.answer)
-    else:
-        existing_complaint = answered.get("chief_complaint", "")
-        pathway_name = classify_pathway(existing_complaint)
+        # Server-owned memory is the source of truth. The browser's `answers`
+        # payload is accepted only as a backward-compatible fallback for older
+        # sessions; it is never allowed to overwrite stored fields silently.
+        answered = _json_loads(state.structured_data, {})
+        if not answered and payload.answers:
+            answered.update(payload.answers)
 
-    risk_level, red_flags = detect_red_flags(payload.question_id, payload.answer, answered)
-    next_question, flow = next_question_for(pathway_name, answered)
-    completed = next_question is None
-    progress = round((len([q for q in flow if q["id"] in answered]) / len(flow)) * 100)
+        extracted = extract_structured(payload.question_id, payload.answer)
+        for key, value in extracted.items():
+            if key not in ("raw", "nlu") and value not in (None, ""):
+                answered[key] = value
 
+        # Keep a compact encounter-level evidence ledger for AI-1B. This is
+        # additive and never replaces the patient's original wording.
+        semantic = extract_clinical_entities(payload.answer, payload.language)
+        evidence_ledger = answered.get("clinical_evidence", [])
+        if not isinstance(evidence_ledger, list):
+            evidence_ledger = []
+        evidence_ledger.append({
+            "question_id": payload.question_id,
+            "text": payload.answer.strip(),
+            "positive_symptoms": semantic.get("positive_symptoms", []),
+            "negated_symptoms": semantic.get("negated_symptoms", []),
+            "duration_mentions": semantic.get("duration_mentions", []),
+            "severity": semantic.get("severity"),
+            "intent": semantic.get("intent", "general"),
+        })
+        answered["clinical_evidence"] = evidence_ledger[-50:]
+
+        # The complaint determines the pathway once it is known. We do not
+        # change an established pathway on every subsequent answer.
+        if not state.pathway:
+            complaint = answered.get("chief_complaint", "")
+            if complaint:
+                state.pathway = classify_pathway(complaint)
+        pathway_name = state.pathway or classify_pathway(answered.get("chief_complaint", ""))
+        state.pathway = pathway_name
+
+        nlp = analyze_nlp_text(payload.answer, payload.language)
+        safety = evaluate_safety(payload.answer, answered)
+        risk_level = safety["risk_level"]
+        red_flags = safety["alerts"]
+
+        # Preserve the highest risk already seen in this encounter.
+        priority = {"none": 0, "watch": 1, "urgent": 2, "emergency": 3}
+        if priority.get(state.risk_level or "none", 0) > priority.get(risk_level, 0):
+            risk_level = state.risk_level
+        else:
+            state.risk_level = risk_level
+        old_flags = _json_loads(state.red_flags, [])
+        merged_flags = {x.get("id"): x for x in old_flags if x.get("id")}
+        for flag in red_flags:
+            merged_flags[flag.get("id")] = flag
+        red_flags = sorted(merged_flags.values(), key=lambda x: priority.get(x.get("level", "none"), 0), reverse=True)
+        state.red_flags = json.dumps(red_flags, ensure_ascii=False)
+
+        answered_ids = _json_loads(state.answered_question_ids, [])
+        if payload.question_id not in answered_ids:
+            answered_ids.append(payload.question_id)
+
+        conversation = _json_loads(state.conversation, [])
+        conversation.append({
+            "question_id": payload.question_id,
+            "question": next((q.get("text") for q in build_question_flow(pathway_name) if q.get("id") == payload.question_id), ""),
+            "answer": payload.answer.strip(),
+            "extracted": {k: v for k, v in extracted.items() if k != "raw"},
+        })
+
+        next_question, flow = next_question_for(pathway_name, answered)
+        completed = next_question is None
+        state.status = "completed" if completed else "active"
+        state.current_question_id = next_question["id"] if next_question else None
+        state.structured_data = json.dumps(answered, ensure_ascii=False)
+        state.answered_question_ids = json.dumps(answered_ids, ensure_ascii=False)
+        state.conversation = json.dumps(conversation, ensure_ascii=False)
+        state.updated_at = datetime.utcnow()
+        db.commit()
+
+        completed_count = len([q for q in flow if q["id"] in answered])
+        return {
+            "message": "Answer received",
+            "question_id": payload.question_id,
+            "extracted": extracted,
+            "nlp": nlp,
+            "pathway": pathway_name,
+            "pathway_label": PATHWAYS[pathway_name]["label"],
+            "next_question": localize_question(next_question, payload.language) if next_question else None,
+            "completed": completed,
+            "language": payload.language,
+            "progress": round((completed_count / len(flow)) * 100),
+            "question_number": completed_count + (0 if completed else 1),
+            "total_questions": len(flow),
+            "risk_level": risk_level,
+            "red_flags": red_flags,
+            "safety": safety,
+            "state": interview_state_response(state),
+            "safety_message": (
+                "Urgent clinical review is recommended based on the responses so far."
+                if risk_level in ("urgent", "emergency") else
+                "No immediate red flag was identified by the prototype rules so far."
+            ),
+        }
+    finally:
+        db.close()
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if not FASTER_WHISPER_AVAILABLE:
+        raise RuntimeError("Voice transcription is not installed. Install faster-whisper first.")
+    if _whisper_model is None:
+        device = WHISPER_DEVICE
+        compute = WHISPER_COMPUTE_TYPE
+        if device == "auto":
+            # faster-whisper accepts cpu/cuda; CPU int8 is the safest default.
+            device = "cpu"
+        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device=device, compute_type=compute)
+    return _whisper_model
+
+
+def _normalize_voice_language(language: str) -> str:
+    value = (language or "en-IN").strip()
+    aliases = {"en": "en-IN", "hi": "hi-IN", "english": "en-IN", "hindi": "hi-IN"}
+    return aliases.get(value.lower(), value)
+
+
+def _voice_language_code(language: str) -> str:
+    return _normalize_voice_language(language).split("-")[0].lower()
+
+
+def _transcribe_audio(path: str, language: str):
+    model = _get_whisper_model()
+    lang = _voice_language_code(language)
+    segments, info = model.transcribe(
+        path,
+        language=lang if lang in {"en", "hi"} else None,
+        vad_filter=True,
+        beam_size=5,
+        condition_on_previous_text=False,
+    )
+    text_value = " ".join(segment.text.strip() for segment in segments).strip()
+    detected = getattr(info, "language", None) or lang
+    return text_value, detected
+
+
+ACCESSIBILITY_INPUT_MODES = {"touch", "voice", "hybrid"}
+ACCESSIBILITY_FONT_SCALES = {"0.9", "1.0", "1.15", "1.3", "1.5", "1.75", "2.0"}
+ACCESSIBILITY_AUDIO_SPEEDS = {"0.75", "1.0", "1.25", "1.5"}
+
+def _accessibility_defaults(patient_id: int):
     return {
-        "message": "Answer received",
-        "question_id": payload.question_id,
-        "extracted": extracted,
-        "nlp": nlp,
-        "pathway": pathway_name,
-        "pathway_label": PATHWAYS[pathway_name]["label"],
-        "next_question": localize_question(next_question, payload.language) if next_question else None,
-        "completed": completed,
-        "language": payload.language if payload.language in SUPPORTED_LANGUAGES else "en-IN",
-        "progress": progress,
-        "question_number": len([q for q in flow if q["id"] in answered]) + (0 if completed else 1),
-        "total_questions": len(flow),
-        "risk_level": risk_level,
-        "red_flags": red_flags,
-        "safety_message": (
-            "Urgent clinical review is recommended based on the responses so far."
-            if risk_level in ("urgent", "emergency") else
-            "No immediate red flag was identified by the prototype rules so far."
-        ),
+        "patient_id": patient_id,
+        "language": "en-IN",
+        "input_mode": "touch",
+        "font_scale": "1.0",
+        "high_contrast": False,
+        "reduced_motion": False,
+        "captions": True,
+        "audio_enabled": True,
+        "audio_speed": "1.0",
+        "assisted_mode": False,
     }
+
+def _serialize_accessibility(row):
+    return {
+        "patient_id": row.patient_id, "language": row.language, "input_mode": row.input_mode,
+        "font_scale": row.font_scale, "high_contrast": bool(row.high_contrast),
+        "reduced_motion": bool(row.reduced_motion), "captions": bool(row.captions),
+        "audio_enabled": bool(row.audio_enabled), "audio_speed": row.audio_speed,
+        "assisted_mode": bool(row.assisted_mode), "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+def _can_access_patient_preferences(actor, patient_id: int):
+    if actor["role"] == "patient" and actor["id"] != patient_id:
+        raise HTTPException(status_code=403, detail="You can only manage your own accessibility preferences.")
+    if actor["role"] not in {"patient", "doctor", "triage", "admin"}:
+        raise HTTPException(status_code=403, detail="Not authorized to access accessibility preferences.")
+
+
+@app.get("/api/accessibility/capabilities")
+def accessibility_capabilities():
+    return {
+        "phase": "AI-5H",
+        "supported_languages": SUPPORTED_LANGUAGES,
+        "input_modes": sorted(ACCESSIBILITY_INPUT_MODES),
+        "font_scales": sorted(ACCESSIBILITY_FONT_SCALES, key=float),
+        "audio_speeds": sorted(ACCESSIBILITY_AUDIO_SPEEDS, key=float),
+        "features": {
+            "voice_input": True,
+            "touch_fallback": True,
+            "captions": True,
+            "high_contrast": True,
+            "reduced_motion": True,
+            "assisted_mode": True,
+            "server_tts": EDGE_TTS_AVAILABLE,
+            "server_stt": FASTER_WHISPER_AVAILABLE,
+        },
+        "tts_languages": [lang for lang in SUPPORTED_LANGUAGES if lang in TTS_VOICE_MAP],
+        "notes": [
+            "Voice transcription availability depends on faster-whisper and its configured model.",
+            "Server text-to-speech currently exposes configured voices only; touch/text fallback remains available for every supported UI language.",
+        ],
+    }
+
+
+@app.get("/api/patients/{patient_id}/accessibility")
+def get_accessibility_preferences(patient_id: int, request: Request):
+    actor = authenticate_request(request)
+    _can_access_patient_preferences(actor, patient_id)
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        row = db.query(AccessibilityPreference).filter(AccessibilityPreference.patient_id == patient_id).first()
+        return {"preferences": _serialize_accessibility(row) if row else _accessibility_defaults(patient_id)}
+    finally:
+        db.close()
+
+
+@app.put("/api/patients/{patient_id}/accessibility")
+def update_accessibility_preferences(patient_id: int, payload: AccessibilityPreferenceRequest, request: Request):
+    actor = authenticate_request(request)
+    _can_access_patient_preferences(actor, patient_id)
+    language = _normalize_voice_language(payload.language)
+    if language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=422, detail=f"Unsupported language. Choose one of: {', '.join(SUPPORTED_LANGUAGES)}")
+    if payload.input_mode not in ACCESSIBILITY_INPUT_MODES:
+        raise HTTPException(status_code=422, detail="input_mode must be touch, voice, or hybrid.")
+    if payload.font_scale not in ACCESSIBILITY_FONT_SCALES:
+        raise HTTPException(status_code=422, detail="font_scale is not supported.")
+    if payload.audio_speed not in ACCESSIBILITY_AUDIO_SPEEDS:
+        raise HTTPException(status_code=422, detail="audio_speed is not supported.")
+    db = SessionLocal()
+    try:
+        patient = db.query(User).filter(User.id == patient_id, User.role == "patient").first()
+        if not patient:
+            raise HTTPException(status_code=404, detail="Patient not found.")
+        row = db.query(AccessibilityPreference).filter(AccessibilityPreference.patient_id == patient_id).first()
+        if not row:
+            row = AccessibilityPreference(patient_id=patient_id)
+            db.add(row)
+        row.language = language
+        row.input_mode = payload.input_mode
+        row.font_scale = payload.font_scale
+        row.high_contrast = int(payload.high_contrast)
+        row.reduced_motion = int(payload.reduced_motion)
+        row.captions = int(payload.captions)
+        row.audio_enabled = int(payload.audio_enabled)
+        row.audio_speed = payload.audio_speed
+        row.assisted_mode = int(payload.assisted_mode)
+        row.updated_at = datetime.utcnow()
+        audit(db, actor["id"], actor["role"], "accessibility_preferences_updated", f"patient:{patient_id}")
+        db.commit(); db.refresh(row)
+        return {"message": "Accessibility preferences saved", "preferences": _serialize_accessibility(row)}
+    finally:
+        db.close()
+
+
+@app.get("/api/voice/status")
+def voice_status():
+    return {
+        "phase": "AI-5H",
+        "transcription": {
+            "available": FASTER_WHISPER_AVAILABLE,
+            "provider": "faster-whisper" if FASTER_WHISPER_AVAILABLE else None,
+            "model": WHISPER_MODEL_SIZE if FASTER_WHISPER_AVAILABLE else None,
+        },
+        "tts": {
+            "available": EDGE_TTS_AVAILABLE,
+            "provider": "edge-tts" if EDGE_TTS_AVAILABLE else None,
+        },
+        "languages": list(SUPPORTED_LANGUAGES.keys()),
+        "tts_languages": [lang for lang in SUPPORTED_LANGUAGES if lang in TTS_VOICE_MAP],
+        "raw_audio_persistence": False,
+        "diagnostic": False,
+    }
+
+
+@app.post("/api/voice/transcribe")
+async def voice_transcribe(
+    audio: UploadFile = File(...),
+    patient_id: int = Form(...),
+    session_id: str = Form(...),
+    language: str = Form("en-IN"),
+    request: Request = None,
+):
+    actor = authenticate_request(request) if request is not None else None
+    if actor and actor["role"] == "patient" and actor["id"] != patient_id:
+        raise HTTPException(status_code=403, detail="You can only submit voice input for your own patient account.")
+    language = _normalize_voice_language(language)
+    if not FASTER_WHISPER_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Voice transcription is not configured. Install faster-whisper and download/use the configured model.")
+    suffix = Path(audio.filename or "audio.webm").suffix.lower() or ".webm"
+    allowed = {".webm", ".wav", ".mp3", ".m4a", ".mp4", ".ogg", ".flac"}
+    if suffix not in allowed:
+        raise HTTPException(status_code=415, detail="Unsupported audio format. Use webm, wav, mp3, m4a, ogg, or flac.")
+    temp_path = None
+    db = SessionLocal()
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=VOICE_TMP_DIR) as tmp:
+            temp_path = tmp.name
+            while True:
+                chunk = await audio.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        size = os.path.getsize(temp_path)
+        if size == 0 or size > 25 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Audio must be between 1 byte and 25 MB.")
+        transcript, detected = _transcribe_audio(temp_path, language)
+        if not transcript:
+            repair = analyze_repair("", event="no_speech", attempt=0, current_language=language)
+            return {
+                "transcript": "",
+                "detected_language": detected,
+                "language": language,
+                "nlu": None,
+                "voice_turn_id": None,
+                "repair": {**repair, "response_text": localized_response(repair, language)},
+                "fallback": {"available": True, "mode": "touch"},
+            }
+        turn = VoiceTurn(patient_id=patient_id, session_id=session_id, language=language, direction="input", transcript=transcript, status="completed", provider="faster-whisper")
+        db.add(turn)
+        db.commit()
+        # Feed the same conservative clinical understanding layer used by text input.
+        nlu = extract_clinical_entities(transcript, language=language)
+        repair = analyze_repair(transcript, event="answer", attempt=0, current_language=language)
+        return {
+            "transcript": transcript,
+            "detected_language": detected,
+            "language": language,
+            "nlu": nlu,
+            "voice_turn_id": turn.id,
+            "repair": {**repair, "response_text": localized_response(repair, language)},
+            "fallback": {"available": True, "mode": "touch"},
+        }
+    finally:
+        db.close()
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+@app.post("/api/voice/speak")
+async def voice_speak(text: str = Form(...), language: str = Form("en-IN")):
+    language = _normalize_voice_language(language)
+    if not EDGE_TTS_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Text-to-speech is not configured. Install edge-tts first.")
+    clean = re.sub(r"\s+", " ", text or "").strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Text is required.")
+    if len(clean) > 1000:
+        raise HTTPException(status_code=413, detail="TTS text is too long for one kiosk prompt.")
+    voice = TTS_VOICE_MAP.get(language, TTS_VOICE_MAP["en-IN"])
+    output_path = VOICE_TMP_DIR / f"tts_{uuid.uuid4().hex}.mp3"
+    try:
+        communicate = edge_tts.Communicate(clean, voice)
+        await communicate.save(str(output_path))
+        return FileResponse(str(output_path), media_type="audio/mpeg", filename="medikiosk_prompt.mp3")
+    except Exception as exc:
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(status_code=502, detail=f"TTS generation failed: {exc}")
+
+
+@app.post("/api/ai/conversation-repair")
+def conversation_repair(payload: ConversationRepairRequest):
+    """AI-1E: classify conversational repair needs without changing clinical meaning."""
+    language = payload.language if payload.language in SUPPORTED_LANGUAGES else "en-IN"
+    db = SessionLocal()
+    try:
+        state = get_or_create_interview_state(db, payload.patient_id, payload.session_id, language)
+        repair = analyze_repair(payload.text, event=payload.event, attempt=payload.attempt, current_language=state.language)
+        if repair.get("requested_language") in SUPPORTED_LANGUAGES:
+            state.language = repair["requested_language"]
+            language = state.language
+        action = repair.get("action")
+        if action in {"repeat_question", "simplify_question", "request_correction", "voice_retry", "touch_fallback", "switch_language"}:
+            state.repair_count = (state.repair_count or 0) + 1
+        if action in {"voice_retry", "touch_fallback"}:
+            state.voice_failure_count = (state.voice_failure_count or 0) + 1
+        state.last_input_mode = payload.input_mode
+        state.last_repair_action = action
+        state.updated_at = datetime.utcnow()
+        db.commit()
+        repair["response_text"] = localized_response(repair, language)
+        repair["language"] = language
+        repair["state"] = interview_state_response(state)
+        return repair
+    finally:
+        db.close()
 
 
 def generate_physician_summary(structured: dict, risk_level: str, red_flags: list, nlp: Optional[dict] = None):
@@ -1947,6 +3842,308 @@ def interview_complete(payload: InterviewComplete):
             "red_flags": red_flags,
             "ai_summary": physician_summary
         }
+    finally:
+        db.close()
+
+
+# ---------- AI-5F: Hospital Administration ----------
+ADMIN_ROLES = {"admin"}
+VALID_DAYS = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
+
+def require_admin(request: Request):
+    actor = authenticate_request(request)
+    if actor["role"] not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Hospital administration is restricted to admin users.")
+    return actor
+
+
+def validate_time_range(start_time: str, end_time: str):
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start_time) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", end_time):
+        raise HTTPException(status_code=422, detail="Times must use HH:MM 24-hour format.")
+    if start_time >= end_time:
+        raise HTTPException(status_code=422, detail="Start time must be earlier than end time.")
+
+
+def serialize_department(d):
+    return {"id": d.id, "name": d.name, "specialty": d.specialty, "active": bool(d.active), "created_at": d.created_at.isoformat() if d.created_at else None}
+
+
+@app.get("/api/admin/departments")
+def admin_list_departments(request: Request):
+    require_admin(request)
+    db = SessionLocal()
+    try:
+        rows = db.query(Department).order_by(Department.name.asc()).all()
+        return {"departments": [serialize_department(d) for d in rows]}
+    finally:
+        db.close()
+
+
+@app.post("/api/admin/departments")
+def admin_create_department(payload: AdminDepartmentRequest, request: Request):
+    actor = require_admin(request)
+    db = SessionLocal()
+    try:
+        name = payload.name.strip()
+        if db.query(Department).filter(Department.name == name).first():
+            raise HTTPException(status_code=409, detail="Department already exists.")
+        d = Department(name=name, specialty=payload.specialty.strip(), active=int(payload.active))
+        db.add(d); db.flush()
+        audit(db, actor["id"], actor["role"], "admin_department_create", f"department:{d.id}")
+        db.commit(); db.refresh(d)
+        return {"message": "Department created", "department": serialize_department(d)}
+    finally:
+        db.close()
+
+
+@app.put("/api/admin/departments/{department_id}")
+def admin_update_department(department_id: int, payload: AdminDepartmentRequest, request: Request):
+    actor = require_admin(request)
+    db = SessionLocal()
+    try:
+        d = db.query(Department).filter(Department.id == department_id).first()
+        if not d: raise HTTPException(status_code=404, detail="Department not found.")
+        name = payload.name.strip()
+        duplicate = db.query(Department).filter(Department.name == name, Department.id != d.id).first()
+        if duplicate: raise HTTPException(status_code=409, detail="Another department already uses this name.")
+        old_name = d.name
+        d.name, d.specialty, d.active = name, payload.specialty.strip(), int(payload.active)
+        # Keep dependent configuration references consistent when an admin renames a department.
+        db.query(OPDConfiguration).filter(OPDConfiguration.department == old_name).update({"department": name}, synchronize_session=False)
+        db.query(DoctorProfile).filter(DoctorProfile.department == old_name).update({"department": name}, synchronize_session=False)
+        db.query(RoutingRule).filter(RoutingRule.department == old_name).update({"department": name}, synchronize_session=False)
+        hospital = db.query(HospitalConfiguration).first()
+        if hospital and hospital.default_department == old_name:
+            hospital.default_department = name
+        audit(db, actor["id"], actor["role"], "admin_department_update", f"department:{d.id}:{old_name}->{d.name}")
+        db.commit(); db.refresh(d)
+        return {"message": "Department updated", "department": serialize_department(d)}
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/doctors")
+def admin_list_doctors(request: Request):
+    require_admin(request)
+    db = SessionLocal()
+    try:
+        rows = db.query(User, DoctorProfile).join(DoctorProfile, DoctorProfile.user_id == User.id).filter(User.role == "doctor").order_by(User.name.asc()).all()
+        return {"doctors": [{"id": u.id, "name": u.name, "email": u.email, "specialty": p.specialty, "department": p.department, "registration_number": p.registration_number or "", "active": bool(p.active)} for u,p in rows]}
+    finally:
+        db.close()
+
+
+@app.post("/api/admin/doctors")
+def admin_create_doctor(payload: AdminDoctorRequest, request: Request):
+    actor = require_admin(request)
+    db = SessionLocal()
+    try:
+        if payload.user_id:
+            user = db.query(User).filter(User.id == payload.user_id).first()
+            if not user: raise HTTPException(status_code=404, detail="User not found.")
+            if user.role != "doctor": raise HTTPException(status_code=422, detail="Selected user is not a doctor.")
+            if db.query(DoctorProfile).filter(DoctorProfile.user_id == user.id).first(): raise HTTPException(status_code=409, detail="Doctor profile already exists.")
+        else:
+            if not payload.name or not payload.email or not payload.password:
+                raise HTTPException(status_code=422, detail="name, email and password are required for a new doctor.")
+            email = payload.email.strip().lower()
+            if db.query(User).filter(User.email == email).first(): raise HTTPException(status_code=409, detail="Email is already registered.")
+            user = User(name=payload.name.strip(), email=email, password_hash=hash_password(payload.password), role="doctor")
+            db.add(user); db.flush()
+        profile = DoctorProfile(user_id=user.id, specialty=payload.specialty.strip(), department=payload.department.strip(), registration_number=payload.registration_number.strip(), active=int(payload.active))
+        db.add(profile); db.flush()
+        audit(db, actor["id"], actor["role"], "admin_doctor_create", f"doctor:{user.id}")
+        db.commit()
+        return {"message": "Doctor created", "doctor": {"id": user.id, "name": user.name, "email": user.email, "specialty": profile.specialty, "department": profile.department, "registration_number": profile.registration_number or "", "active": bool(profile.active)}}
+    finally:
+        db.close()
+
+
+@app.put("/api/admin/doctors/{doctor_id}")
+def admin_update_doctor(doctor_id: int, payload: AdminDoctorRequest, request: Request):
+    actor = require_admin(request)
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == doctor_id, User.role == "doctor").first()
+        if not user: raise HTTPException(status_code=404, detail="Doctor not found.")
+        profile = db.query(DoctorProfile).filter(DoctorProfile.user_id == doctor_id).first()
+        if not profile:
+            profile = DoctorProfile(user_id=doctor_id); db.add(profile)
+        if payload.name: user.name = payload.name.strip()
+        if payload.email:
+            email = payload.email.strip().lower()
+            dup = db.query(User).filter(User.email == email, User.id != doctor_id).first()
+            if dup: raise HTTPException(status_code=409, detail="Email is already registered.")
+            user.email = email
+        if payload.password: user.password_hash = hash_password(payload.password)
+        profile.specialty, profile.department = payload.specialty.strip(), payload.department.strip()
+        profile.registration_number, profile.active = payload.registration_number.strip(), int(payload.active)
+        audit(db, actor["id"], actor["role"], "admin_doctor_update", f"doctor:{doctor_id}")
+        db.commit()
+        return {"message": "Doctor updated", "doctor_id": doctor_id, "active": bool(profile.active)}
+    finally:
+        db.close()
+
+
+@app.get("/api/admin/opd-config")
+def admin_list_opd(request: Request):
+    require_admin(request)
+    db = SessionLocal()
+    try:
+        rows = db.query(OPDConfiguration).order_by(OPDConfiguration.department.asc()).all()
+        return {"opd_configurations": [{"id": r.id, "department": r.department, "working_days": r.working_days.split(",") if r.working_days else [], "start_time": r.start_time, "end_time": r.end_time, "active": bool(r.active)} for r in rows]}
+    finally: db.close()
+
+
+@app.post("/api/admin/opd-config")
+def admin_upsert_opd(payload: AdminOPDRequest, request: Request):
+    actor = require_admin(request)
+    if any(day not in VALID_DAYS for day in payload.working_days): raise HTTPException(status_code=422, detail="working_days contains an invalid day.")
+    validate_time_range(payload.start_time, payload.end_time)
+    db = SessionLocal()
+    try:
+        row = db.query(OPDConfiguration).filter(OPDConfiguration.department == payload.department.strip()).first()
+        if not row: row = OPDConfiguration(department=payload.department.strip()); db.add(row)
+        row.working_days = ",".join(dict.fromkeys(payload.working_days)); row.start_time = payload.start_time; row.end_time = payload.end_time; row.active = int(payload.active); row.updated_at = datetime.utcnow()
+        audit(db, actor["id"], actor["role"], "admin_opd_config_update", f"department:{row.department}")
+        db.commit(); db.refresh(row)
+        return {"message": "OPD configuration saved", "id": row.id, "department": row.department, "working_days": row.working_days.split(","), "start_time": row.start_time, "end_time": row.end_time, "active": bool(row.active)}
+    finally: db.close()
+
+
+@app.get("/api/admin/availability")
+def admin_list_availability(request: Request, doctor_id: Optional[int] = None):
+    require_admin(request)
+    db = SessionLocal()
+    try:
+        q = db.query(DoctorAvailability)
+        if doctor_id: q = q.filter(DoctorAvailability.doctor_id == doctor_id)
+        rows = q.order_by(DoctorAvailability.doctor_id, DoctorAvailability.day_of_week, DoctorAvailability.start_time).all()
+        return {"availability": [{"id": r.id, "doctor_id": r.doctor_id, "day_of_week": r.day_of_week, "start_time": r.start_time, "end_time": r.end_time, "active": bool(r.active)} for r in rows]}
+    finally: db.close()
+
+
+@app.post("/api/admin/availability")
+def admin_create_availability(payload: AdminAvailabilityRequest, request: Request):
+    actor = require_admin(request)
+    if payload.day_of_week not in VALID_DAYS: raise HTTPException(status_code=422, detail="Invalid day_of_week.")
+    validate_time_range(payload.start_time, payload.end_time)
+    db = SessionLocal()
+    try:
+        doctor = db.query(User).filter(User.id == payload.doctor_id, User.role == "doctor").first()
+        if not doctor: raise HTTPException(status_code=404, detail="Doctor not found.")
+        if db.query(DoctorAvailability).filter(DoctorAvailability.doctor_id == payload.doctor_id, DoctorAvailability.day_of_week == payload.day_of_week, DoctorAvailability.start_time == payload.start_time, DoctorAvailability.end_time == payload.end_time).first(): raise HTTPException(status_code=409, detail="Availability window already exists.")
+        row = DoctorAvailability(doctor_id=payload.doctor_id, day_of_week=payload.day_of_week, start_time=payload.start_time, end_time=payload.end_time, active=int(payload.active))
+        db.add(row); db.flush(); audit(db, actor["id"], actor["role"], "admin_availability_create", f"availability:{row.id}"); db.commit()
+        return {"message": "Doctor availability created", "availability_id": row.id}
+    finally: db.close()
+
+
+@app.put("/api/admin/availability/{availability_id}")
+def admin_update_availability(availability_id: int, payload: AdminAvailabilityRequest, request: Request):
+    actor = require_admin(request)
+    if payload.day_of_week not in VALID_DAYS: raise HTTPException(status_code=422, detail="Invalid day_of_week.")
+    validate_time_range(payload.start_time, payload.end_time)
+    db = SessionLocal()
+    try:
+        row = db.query(DoctorAvailability).filter(DoctorAvailability.id == availability_id).first()
+        if not row: raise HTTPException(status_code=404, detail="Availability not found.")
+        doctor = db.query(User).filter(User.id == payload.doctor_id, User.role == "doctor").first()
+        if not doctor: raise HTTPException(status_code=404, detail="Doctor not found.")
+        duplicate = db.query(DoctorAvailability).filter(DoctorAvailability.doctor_id == payload.doctor_id, DoctorAvailability.day_of_week == payload.day_of_week, DoctorAvailability.start_time == payload.start_time, DoctorAvailability.end_time == payload.end_time, DoctorAvailability.id != row.id).first()
+        if duplicate: raise HTTPException(status_code=409, detail="Availability window already exists.")
+        row.doctor_id, row.day_of_week, row.start_time, row.end_time, row.active = payload.doctor_id, payload.day_of_week, payload.start_time, payload.end_time, int(payload.active)
+        audit(db, actor["id"], actor["role"], "admin_availability_update", f"availability:{row.id}"); db.commit()
+        return {"message": "Doctor availability updated", "availability_id": row.id}
+    finally: db.close()
+
+
+@app.get("/api/admin/routing")
+def admin_list_routing(request: Request):
+    require_admin(request)
+    db = SessionLocal()
+    try:
+        rows = db.query(RoutingRule).order_by(RoutingRule.department, RoutingRule.priority, RoutingRule.id).all()
+        return {"routing_rules": [{"id": r.id, "department": r.department, "specialty": r.specialty, "doctor_id": r.doctor_id, "priority": r.priority, "active": bool(r.active)} for r in rows]}
+    finally: db.close()
+
+
+@app.post("/api/admin/routing")
+def admin_create_routing(payload: AdminRoutingRequest, request: Request):
+    actor = require_admin(request)
+    db = SessionLocal()
+    try:
+        if payload.doctor_id and not db.query(User).filter(User.id == payload.doctor_id, User.role == "doctor").first(): raise HTTPException(status_code=404, detail="Doctor not found.")
+        row = RoutingRule(department=payload.department.strip(), specialty=payload.specialty.strip(), doctor_id=payload.doctor_id, priority=payload.priority, active=int(payload.active))
+        db.add(row); db.flush(); audit(db, actor["id"], actor["role"], "admin_routing_create", f"routing:{row.id}"); db.commit()
+        return {"message": "Routing rule created", "routing_rule_id": row.id}
+    finally: db.close()
+
+
+@app.put("/api/admin/routing/{routing_id}")
+def admin_update_routing(routing_id: int, payload: AdminRoutingRequest, request: Request):
+    actor = require_admin(request)
+    db = SessionLocal()
+    try:
+        row = db.query(RoutingRule).filter(RoutingRule.id == routing_id).first()
+        if not row: raise HTTPException(status_code=404, detail="Routing rule not found.")
+        if payload.doctor_id and not db.query(User).filter(User.id == payload.doctor_id, User.role == "doctor").first(): raise HTTPException(status_code=404, detail="Doctor not found.")
+        row.department, row.specialty, row.doctor_id, row.priority, row.active = payload.department.strip(), payload.specialty.strip(), payload.doctor_id, payload.priority, int(payload.active)
+        audit(db, actor["id"], actor["role"], "admin_routing_update", f"routing:{row.id}"); db.commit()
+        return {"message": "Routing rule updated", "routing_rule_id": row.id}
+    finally: db.close()
+
+
+@app.get("/api/admin/hospital")
+def admin_get_hospital(request: Request):
+    require_admin(request)
+    db = SessionLocal()
+    try:
+        row = db.query(HospitalConfiguration).first()
+        if not row: row = HospitalConfiguration(); db.add(row); db.commit(); db.refresh(row)
+        return {"hospital": {"id": row.id, "hospital_name": row.hospital_name, "facility_code": row.facility_code, "timezone": row.timezone, "default_department": row.default_department, "active": bool(row.active)}}
+    finally: db.close()
+
+
+@app.put("/api/admin/hospital")
+def admin_update_hospital(payload: AdminHospitalRequest, request: Request):
+    actor = require_admin(request)
+    db = SessionLocal()
+    try:
+        row = db.query(HospitalConfiguration).first()
+        if not row: row = HospitalConfiguration(); db.add(row)
+        row.hospital_name, row.facility_code, row.timezone, row.default_department, row.active = payload.hospital_name.strip(), payload.facility_code.strip(), payload.timezone.strip(), payload.default_department.strip(), int(payload.active)
+        row.updated_at = datetime.utcnow()
+        audit(db, actor["id"], actor["role"], "admin_hospital_update", "hospital_configuration")
+        db.commit(); db.refresh(row)
+        return {"message": "Hospital configuration saved", "hospital": {"id": row.id, "hospital_name": row.hospital_name, "facility_code": row.facility_code, "timezone": row.timezone, "default_department": row.default_department, "active": bool(row.active)}}
+    finally: db.close()
+
+
+@app.get("/api/admin/analytics")
+def admin_analytics(request: Request, start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """Aggregate operational analytics for hospital administrators.
+
+    Metrics are read-only and intentionally aggregate; this endpoint does not
+    expose individual patient records or make clinical decisions.
+    """
+    require_admin(request)
+    db = SessionLocal()
+    try:
+        try:
+            return build_analytics_dashboard(
+                db,
+                Encounter=Encounter,
+                Consultation=Consultation,
+                MedicalDocument=MedicalDocument,
+                AuditEvent=AuditEvent,
+                User=User,
+                Department=Department,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
     finally:
         db.close()
 
